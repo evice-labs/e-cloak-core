@@ -38,6 +38,7 @@ public:
     std::string getSchnorrPublicKey();
     std::string getIdentityInfo();
     std::string getNetworkStatus();
+    std::string recordStake(uint64_t amount);
 
     // --- Room Operations ---
     std::string createRoom(const std::string& adminCommitmentHex, uint64_t nThreshold, uint64_t mTotal, const std::string& moderatorPubkeysJson, uint64_t creationIndex, uint64_t minMembersForMaturity);
@@ -73,6 +74,8 @@ private:
     FfiModeratorClient* m_moderator = nullptr;
     FfiSlashAggregator* m_aggregator = nullptr;
     std::string m_cachedUsername;
+    bool m_staked = false;
+    uint64_t m_stakeAmount = 0;
     void loadPersistedIdentity();
     void savePersistedIdentity();
 };

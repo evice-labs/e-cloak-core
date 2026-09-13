@@ -128,6 +128,12 @@ void ElAnonChatCoreImpl::loadPersistedIdentity()
             if (bytes.size() == 32) {
                 if (m_registration) ffi_registration_free(m_registration);
                 m_registration = ffi_registration_from_nsk(bytes.data());
+                if (j.contains("staked") && j["staked"].is_boolean()) {
+                    m_staked = j["staked"].get<bool>();
+                    if (j.contains("stake_amount") && j["stake_amount"].is_number_unsigned()) {
+                        m_stakeAmount = j["stake_amount"].get<uint64_t>();
+                    }
+                }
                 if (j.contains("username") && j["username"].is_string() && m_usernameRegistry) {
                     std::string u = j["username"].get<std::string>();
                     m_cachedUsername = u;
@@ -156,6 +162,8 @@ void ElAnonChatCoreImpl::savePersistedIdentity()
         j["commitment"] = bytesToHex(comm, 32);
         j["nsk"] = bytesToHex(nsk, 32);
         j["username"] = m_cachedUsername;
+        j["staked"] = m_staked;
+        j["stake_amount"] = m_stakeAmount;
 
         std::string path = getIdentityFilePath();
         std::ofstream file(path);
@@ -183,6 +191,8 @@ std::string ElAnonChatCoreImpl::getIdentityInfo()
     res["commitment"] = bytesToHex(comm, 32);
     res["nsk"] = bytesToHex(nsk, 32);
     res["username"] = m_cachedUsername;
+    res["staked"] = m_staked;
+    res["stake_amount"] = m_stakeAmount;
     res["schnorr_pubkey"] = getSchnorrPublicKey();
     return res.dump();
 }
@@ -195,7 +205,8 @@ std::string ElAnonChatCoreImpl::getNetworkStatus()
     res["sequencer_url"] = "https://testnet.lez.logos.co/";
     res["min_stake_amount"] = 150;
     res["required_collateral_lez"] = 150;
-    res["collateral_active"] = (m_registration != nullptr);
+    res["collateral_active"] = m_staked;
+    res["stake_amount"] = m_stakeAmount;
     res["has_active_identity"] = (m_registration != nullptr);
     if (m_registration) {
         uint8_t comm[32];
@@ -205,6 +216,19 @@ std::string ElAnonChatCoreImpl::getNetworkStatus()
         res["commitment"] = "";
     }
     return res.dump();
+}
+
+std::string ElAnonChatCoreImpl::recordStake(uint64_t amount)
+{
+    if (!m_registration) return makeErrorJson("No active identity to stake for");
+    m_staked = true;
+    m_stakeAmount = amount;
+    savePersistedIdentity();
+    json j;
+    j["ok"] = true;
+    j["staked"] = true;
+    j["stake_amount"] = amount;
+    return j.dump();
 }
 
 std::string ElAnonChatCoreImpl::createIdentity(const std::string& nskHex)
