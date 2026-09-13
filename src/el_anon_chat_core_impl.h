@@ -36,6 +36,8 @@ public:
     std::string lookupUsername(const std::string& commitmentHex);
     bool hasActiveIdentity();
     std::string getSchnorrPublicKey();
+    std::string getIdentityInfo();
+    std::string getNetworkStatus();
 
     // --- Room Operations ---
     std::string createRoom(const std::string& adminCommitmentHex, uint64_t nThreshold, uint64_t mTotal, const std::string& moderatorPubkeysJson, uint64_t creationIndex, uint64_t minMembersForMaturity);
@@ -70,4 +72,7 @@ private:
     FfiMemberClient* m_member = nullptr;
     FfiModeratorClient* m_moderator = nullptr;
     FfiSlashAggregator* m_aggregator = nullptr;
+    std::string m_cachedUsername;
+    void loadPersistedIdentity();
+    void savePersistedIdentity();
 };

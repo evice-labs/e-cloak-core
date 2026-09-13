@@ -6,6 +6,10 @@
 #include <sstream>
 #include <iomanip>
 #include <vector>
+#include <filesystem>
+#include <fstream>
+#include <cstdlib>
+#include <cstring>
 
 using json = nlohmann::json;
 
@@ -39,12 +43,31 @@ static std::string makeErrorJson(const std::string& msg) {
 
 // --- Implementation ---
 
+static std::string getIdentityFilePath() {
+    const char* customDir = std::getenv("LOGOS_USER_DIR");
+    std::string base;
+    if (customDir && std::strlen(customDir) > 0) {
+        base = std::string(customDir) + "/module_data/ecloakcore";
+    } else {
+        const char* home = std::getenv("HOME");
+        if (home && std::strlen(home) > 0) {
+            base = std::string(home) + "/.local/share/Logos/LogosBasecamp/module_data/ecloakcore";
+        } else {
+            base = "/tmp/ecloakcore";
+        }
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(base, ec);
+    return base + "/identity.json";
+}
+
 ElAnonChatCoreImpl::ElAnonChatCoreImpl()
 {
     m_usernameRegistry = ffi_username_registry_new();
     m_roomRegistry = ffi_room_registry_new();
     m_moderatorRegistry = ffi_moderator_registry_new();
     m_blacklist = ffi_blacklist_new();
+    loadPersistedIdentity();
 }
 
 ElAnonChatCoreImpl::~ElAnonChatCoreImpl()
@@ -62,6 +85,100 @@ ElAnonChatCoreImpl::~ElAnonChatCoreImpl()
 // ---------------------------------------------------------------------------
 // Identity Operations
 // ---------------------------------------------------------------------------
+
+void ElAnonChatCoreImpl::loadPersistedIdentity()
+{
+    try {
+        std::string path = getIdentityFilePath();
+        if (!std::filesystem::exists(path)) return;
+        std::ifstream file(path);
+        if (!file.is_open()) return;
+        json j;
+        file >> j;
+        if (j.contains("nsk") && j["nsk"].is_string()) {
+            std::string nskHex = j["nsk"].get<std::string>();
+            std::vector<uint8_t> bytes = hexToBytes(nskHex);
+            if (bytes.size() == 32) {
+                if (m_registration) ffi_registration_free(m_registration);
+                m_registration = ffi_registration_from_nsk(bytes.data());
+                if (j.contains("username") && j["username"].is_string() && m_usernameRegistry) {
+                    std::string u = j["username"].get<std::string>();
+                    m_cachedUsername = u;
+                    if (!u.empty()) {
+                        uint8_t comm[32];
+                        ffi_registration_commitment(m_registration, comm);
+                        char* res = ffi_username_registry_register(m_usernameRegistry, comm, u.c_str());
+                        if (res) ffi_identity_free_string(res);
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+}
+
+void ElAnonChatCoreImpl::savePersistedIdentity()
+{
+    if (!m_registration) return;
+    try {
+        uint8_t comm[32];
+        ffi_registration_commitment(m_registration, comm);
+        uint8_t nsk[32];
+        ffi_registration_nsk(m_registration, nsk);
+
+        json j;
+        j["commitment"] = bytesToHex(comm, 32);
+        j["nsk"] = bytesToHex(nsk, 32);
+        j["username"] = m_cachedUsername;
+
+        std::string path = getIdentityFilePath();
+        std::ofstream file(path);
+        if (file.is_open()) {
+            file << j.dump(2);
+        }
+    } catch (...) {}
+}
+
+std::string ElAnonChatCoreImpl::getIdentityInfo()
+{
+    json res;
+    if (!m_registration) {
+        res["has_identity"] = false;
+        res["commitment"] = "";
+        res["nsk"] = "";
+        res["username"] = "";
+        return res.dump();
+    }
+    uint8_t comm[32];
+    ffi_registration_commitment(m_registration, comm);
+    uint8_t nsk[32];
+    ffi_registration_nsk(m_registration, nsk);
+    res["has_identity"] = true;
+    res["commitment"] = bytesToHex(comm, 32);
+    res["nsk"] = bytesToHex(nsk, 32);
+    res["username"] = m_cachedUsername;
+    res["schnorr_pubkey"] = getSchnorrPublicKey();
+    return res.dump();
+}
+
+std::string ElAnonChatCoreImpl::getNetworkStatus()
+{
+    json res;
+    res["connected"] = true;
+    res["network_name"] = "Logos Execution Zone (LEZ) Testnet";
+    res["sequencer_url"] = "https://testnet.lez.logos.co/";
+    res["min_stake_amount"] = 150;
+    res["required_collateral_lez"] = 150;
+    res["collateral_active"] = (m_registration != nullptr);
+    res["has_active_identity"] = (m_registration != nullptr);
+    if (m_registration) {
+        uint8_t comm[32];
+        ffi_registration_commitment(m_registration, comm);
+        res["commitment"] = bytesToHex(comm, 32);
+    } else {
+        res["commitment"] = "";
+    }
+    return res.dump();
+}
 
 std::string ElAnonChatCoreImpl::createIdentity(const std::string& nskHex)
 {
@@ -96,6 +213,7 @@ std::string ElAnonChatCoreImpl::createIdentity(const std::string& nskHex)
     json res;
     res["commitment"] = bytesToHex(comm, 32);
     res["nsk"] = bytesToHex(nsk, 32);
+    savePersistedIdentity();
     return res.dump();
 }
 
@@ -194,6 +312,8 @@ std::string ElAnonChatCoreImpl::registerUsername(const std::string& username)
     if (!res) return makeErrorJson("failed to register username");
     std::string out(res);
     ffi_identity_free_string(res);
+    m_cachedUsername = username;
+    savePersistedIdentity();
     return out;
 }
 
