@@ -44,10 +44,35 @@ static std::string makeErrorJson(const std::string& msg) {
 // --- Implementation ---
 
 static std::string getIdentityFilePath() {
+    // 1. Highest priority: Basecamp environment override (portable mode or custom --user-dir)
     const char* customDir = std::getenv("LOGOS_USER_DIR");
-    std::string base;
     if (customDir && std::strlen(customDir) > 0) {
-        base = std::string(customDir) + "/module_data/ecloakcore";
+        std::string base = std::string(customDir) + "/module_data/ecloakcore";
+        std::error_code ec;
+        std::filesystem::create_directories(base, ec);
+        return base + "/identity.json";
+    }
+
+    std::string base;
+#if defined(_WIN32)
+    const char* appData = std::getenv("APPDATA");
+    if (appData && std::strlen(appData) > 0) {
+        base = std::string(appData) + "/Logos/LogosBasecamp/module_data/ecloakcore";
+    } else {
+        base = "C:/LogosBasecamp/module_data/ecloakcore";
+    }
+#elif defined(__APPLE__)
+    const char* home = std::getenv("HOME");
+    if (home && std::strlen(home) > 0) {
+        base = std::string(home) + "/Library/Application Support/Logos/LogosBasecamp/module_data/ecloakcore";
+    } else {
+        base = "/tmp/ecloakcore";
+    }
+#else
+    // Linux and Unix-like OS (follows XDG Base Directory specification)
+    const char* xdgData = std::getenv("XDG_DATA_HOME");
+    if (xdgData && std::strlen(xdgData) > 0) {
+        base = std::string(xdgData) + "/Logos/LogosBasecamp/module_data/ecloakcore";
     } else {
         const char* home = std::getenv("HOME");
         if (home && std::strlen(home) > 0) {
@@ -56,6 +81,8 @@ static std::string getIdentityFilePath() {
             base = "/tmp/ecloakcore";
         }
     }
+#endif
+
     std::error_code ec;
     std::filesystem::create_directories(base, ec);
     return base + "/identity.json";
