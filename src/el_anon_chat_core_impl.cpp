@@ -233,6 +233,16 @@ std::string ElAnonChatCoreImpl::recordStake(uint64_t amount)
 
 std::string ElAnonChatCoreImpl::createIdentity(const std::string& nskHex)
 {
+    // Anti-Bypass Guard: Prevent regeneration if an active unrevoked identity already exists
+    if (m_registration != nullptr) {
+        uint8_t existingComm[32];
+        ffi_registration_commitment(m_registration, existingComm);
+        bool revoked = (m_blacklist && ffi_blacklist_is_revoked(m_blacklist, existingComm) == 1);
+        if (!revoked) {
+            return makeErrorJson("Active identity already exists. Regeneration is prohibited unless revoked by slashing.");
+        }
+    }
+
     if (m_registration) {
         ffi_registration_free(m_registration);
         m_registration = nullptr;
@@ -349,10 +359,31 @@ std::string ElAnonChatCoreImpl::registerUsername(const std::string& username)
 
     uint8_t comm[32];
     ffi_registration_commitment(m_registration, comm);
+    std::string myCommHex = bytesToHex(comm, 32);
 
     if (m_blacklist && ffi_blacklist_is_revoked(m_blacklist, comm) == 1) {
         return makeErrorJson("identity has been revoked — cannot register username");
     }
+
+    // Ownership & Collision Check: If username is already taken by a DIFFERENT commitment, reject
+    char* lookupJson = ffi_username_registry_lookup_by_username(m_usernameRegistry, username.c_str());
+    if (lookupJson) {
+        std::string s(lookupJson);
+        ffi_identity_free_string(lookupJson);
+        try {
+            json j = json::parse(s);
+            if (j.contains("commitment") && j["commitment"].is_string()) {
+                std::string owner = j["commitment"].get<std::string>();
+                if (!owner.empty() && owner != myCommHex) {
+                    return makeErrorJson("Username already taken");
+                }
+            }
+        } catch (...) {}
+    }
+
+    // Upsert semantic: Reset local registry so previous aliases for this commitment are released
+    ffi_username_registry_free(m_usernameRegistry);
+    m_usernameRegistry = ffi_username_registry_new();
 
     char* res = ffi_username_registry_register(
         m_usernameRegistry,
