@@ -6,6 +6,10 @@
 #include <sstream>
 #include <iomanip>
 #include <vector>
+#include <filesystem>
+#include <fstream>
+#include <cstdlib>
+#include <cstring>
 
 using json = nlohmann::json;
 
@@ -39,12 +43,58 @@ static std::string makeErrorJson(const std::string& msg) {
 
 // --- Implementation ---
 
+static std::string getIdentityFilePath() {
+    // 1. Highest priority: Basecamp environment override (portable mode or custom --user-dir)
+    const char* customDir = std::getenv("LOGOS_USER_DIR");
+    if (customDir && std::strlen(customDir) > 0) {
+        std::string base = std::string(customDir) + "/module_data/ecloakcore";
+        std::error_code ec;
+        std::filesystem::create_directories(base, ec);
+        return base + "/identity.json";
+    }
+
+    std::string base;
+#if defined(_WIN32)
+    const char* appData = std::getenv("APPDATA");
+    if (appData && std::strlen(appData) > 0) {
+        base = std::string(appData) + "/Logos/LogosBasecamp/module_data/ecloakcore";
+    } else {
+        base = "C:/LogosBasecamp/module_data/ecloakcore";
+    }
+#elif defined(__APPLE__)
+    const char* home = std::getenv("HOME");
+    if (home && std::strlen(home) > 0) {
+        base = std::string(home) + "/Library/Application Support/Logos/LogosBasecamp/module_data/ecloakcore";
+    } else {
+        base = "/tmp/ecloakcore";
+    }
+#else
+    // Linux and Unix-like OS (follows XDG Base Directory specification)
+    const char* xdgData = std::getenv("XDG_DATA_HOME");
+    if (xdgData && std::strlen(xdgData) > 0) {
+        base = std::string(xdgData) + "/Logos/LogosBasecamp/module_data/ecloakcore";
+    } else {
+        const char* home = std::getenv("HOME");
+        if (home && std::strlen(home) > 0) {
+            base = std::string(home) + "/.local/share/Logos/LogosBasecamp/module_data/ecloakcore";
+        } else {
+            base = "/tmp/ecloakcore";
+        }
+    }
+#endif
+
+    std::error_code ec;
+    std::filesystem::create_directories(base, ec);
+    return base + "/identity.json";
+}
+
 ElAnonChatCoreImpl::ElAnonChatCoreImpl()
 {
     m_usernameRegistry = ffi_username_registry_new();
     m_roomRegistry = ffi_room_registry_new();
     m_moderatorRegistry = ffi_moderator_registry_new();
     m_blacklist = ffi_blacklist_new();
+    loadPersistedIdentity();
 }
 
 ElAnonChatCoreImpl::~ElAnonChatCoreImpl()
@@ -63,8 +113,136 @@ ElAnonChatCoreImpl::~ElAnonChatCoreImpl()
 // Identity Operations
 // ---------------------------------------------------------------------------
 
+void ElAnonChatCoreImpl::loadPersistedIdentity()
+{
+    try {
+        std::string path = getIdentityFilePath();
+        if (!std::filesystem::exists(path)) return;
+        std::ifstream file(path);
+        if (!file.is_open()) return;
+        json j;
+        file >> j;
+        if (j.contains("nsk") && j["nsk"].is_string()) {
+            std::string nskHex = j["nsk"].get<std::string>();
+            std::vector<uint8_t> bytes = hexToBytes(nskHex);
+            if (bytes.size() == 32) {
+                if (m_registration) ffi_registration_free(m_registration);
+                m_registration = ffi_registration_from_nsk(bytes.data());
+                if (j.contains("staked") && j["staked"].is_boolean()) {
+                    m_staked = j["staked"].get<bool>();
+                    if (j.contains("stake_amount") && j["stake_amount"].is_number_unsigned()) {
+                        m_stakeAmount = j["stake_amount"].get<uint64_t>();
+                    }
+                }
+                if (j.contains("username") && j["username"].is_string() && m_usernameRegistry) {
+                    std::string u = j["username"].get<std::string>();
+                    m_cachedUsername = u;
+                    if (!u.empty()) {
+                        uint8_t comm[32];
+                        ffi_registration_commitment(m_registration, comm);
+                        char* res = ffi_username_registry_register(m_usernameRegistry, comm, u.c_str());
+                        if (res) ffi_identity_free_string(res);
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+}
+
+void ElAnonChatCoreImpl::savePersistedIdentity()
+{
+    if (!m_registration) return;
+    try {
+        uint8_t comm[32];
+        ffi_registration_commitment(m_registration, comm);
+        uint8_t nsk[32];
+        ffi_registration_nsk(m_registration, nsk);
+
+        json j;
+        j["commitment"] = bytesToHex(comm, 32);
+        j["nsk"] = bytesToHex(nsk, 32);
+        j["username"] = m_cachedUsername;
+        j["staked"] = m_staked;
+        j["stake_amount"] = m_stakeAmount;
+
+        std::string path = getIdentityFilePath();
+        std::ofstream file(path);
+        if (file.is_open()) {
+            file << j.dump(2);
+        }
+    } catch (...) {}
+}
+
+std::string ElAnonChatCoreImpl::getIdentityInfo()
+{
+    json res;
+    if (!m_registration) {
+        res["has_identity"] = false;
+        res["commitment"] = "";
+        res["nsk"] = "";
+        res["username"] = "";
+        return res.dump();
+    }
+    uint8_t comm[32];
+    ffi_registration_commitment(m_registration, comm);
+    uint8_t nsk[32];
+    ffi_registration_nsk(m_registration, nsk);
+    res["has_identity"] = true;
+    res["commitment"] = bytesToHex(comm, 32);
+    res["nsk"] = bytesToHex(nsk, 32);
+    res["username"] = m_cachedUsername;
+    res["staked"] = m_staked;
+    res["stake_amount"] = m_stakeAmount;
+    res["schnorr_pubkey"] = getSchnorrPublicKey();
+    return res.dump();
+}
+
+std::string ElAnonChatCoreImpl::getNetworkStatus()
+{
+    json res;
+    res["connected"] = true;
+    res["network_name"] = "Logos Execution Zone (LEZ) Testnet";
+    res["sequencer_url"] = "https://testnet.lez.logos.co/";
+    res["min_stake_amount"] = 150;
+    res["required_collateral_lez"] = 150;
+    res["collateral_active"] = m_staked;
+    res["stake_amount"] = m_stakeAmount;
+    res["has_active_identity"] = (m_registration != nullptr);
+    if (m_registration) {
+        uint8_t comm[32];
+        ffi_registration_commitment(m_registration, comm);
+        res["commitment"] = bytesToHex(comm, 32);
+    } else {
+        res["commitment"] = "";
+    }
+    return res.dump();
+}
+
+std::string ElAnonChatCoreImpl::recordStake(uint64_t amount)
+{
+    if (!m_registration) return makeErrorJson("No active identity to stake for");
+    m_staked = true;
+    m_stakeAmount = amount;
+    savePersistedIdentity();
+    json j;
+    j["ok"] = true;
+    j["staked"] = true;
+    j["stake_amount"] = amount;
+    return j.dump();
+}
+
 std::string ElAnonChatCoreImpl::createIdentity(const std::string& nskHex)
 {
+    // Anti-Bypass Guard: Prevent regeneration if an active unrevoked identity already exists
+    if (m_registration != nullptr) {
+        uint8_t existingComm[32];
+        ffi_registration_commitment(m_registration, existingComm);
+        bool revoked = (m_blacklist && ffi_blacklist_is_revoked(m_blacklist, existingComm) == 1);
+        if (!revoked) {
+            return makeErrorJson("Active identity already exists. Regeneration is prohibited unless revoked by slashing.");
+        }
+    }
+
     if (m_registration) {
         ffi_registration_free(m_registration);
         m_registration = nullptr;
@@ -96,6 +274,7 @@ std::string ElAnonChatCoreImpl::createIdentity(const std::string& nskHex)
     json res;
     res["commitment"] = bytesToHex(comm, 32);
     res["nsk"] = bytesToHex(nsk, 32);
+    savePersistedIdentity();
     return res.dump();
 }
 
@@ -180,10 +359,31 @@ std::string ElAnonChatCoreImpl::registerUsername(const std::string& username)
 
     uint8_t comm[32];
     ffi_registration_commitment(m_registration, comm);
+    std::string myCommHex = bytesToHex(comm, 32);
 
     if (m_blacklist && ffi_blacklist_is_revoked(m_blacklist, comm) == 1) {
         return makeErrorJson("identity has been revoked — cannot register username");
     }
+
+    // Ownership & Collision Check: If username is already taken by a DIFFERENT commitment, reject
+    char* lookupJson = ffi_username_registry_lookup_by_username(m_usernameRegistry, username.c_str());
+    if (lookupJson) {
+        std::string s(lookupJson);
+        ffi_identity_free_string(lookupJson);
+        try {
+            json j = json::parse(s);
+            if (j.contains("commitment") && j["commitment"].is_string()) {
+                std::string owner = j["commitment"].get<std::string>();
+                if (!owner.empty() && owner != myCommHex) {
+                    return makeErrorJson("Username already taken");
+                }
+            }
+        } catch (...) {}
+    }
+
+    // Upsert semantic: Reset local registry so previous aliases for this commitment are released
+    ffi_username_registry_free(m_usernameRegistry);
+    m_usernameRegistry = ffi_username_registry_new();
 
     char* res = ffi_username_registry_register(
         m_usernameRegistry,
@@ -194,6 +394,8 @@ std::string ElAnonChatCoreImpl::registerUsername(const std::string& username)
     if (!res) return makeErrorJson("failed to register username");
     std::string out(res);
     ffi_identity_free_string(res);
+    m_cachedUsername = username;
+    savePersistedIdentity();
     return out;
 }
 
