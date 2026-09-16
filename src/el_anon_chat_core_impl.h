@@ -64,6 +64,16 @@ public:
     bool isRevoked(const std::string& commitmentHex);
     std::string revokeCommitment(const std::string& commitmentHex);
 
+    // --- Blob Media Storage Operations ---
+    std::string saveBlob(const std::string& base64Data, const std::string& fileName, const std::string& mimeType);
+    std::string loadBlob(const std::string& blobId);
+    std::string getBlobPath(const std::string& blobId);
+
+    // --- Persistent Chat Store Operations (AES-256-GCM + Zstd) ---
+    std::string saveChatStore(const std::string& chatStoreJson);
+    std::string loadChatStore();
+    std::string clearChatStore();
+
 private:
     FfiRegistrationClient* m_registration = nullptr;
     FfiUsernameRegistry* m_usernameRegistry = nullptr;
@@ -78,4 +88,5 @@ private:
     uint64_t m_stakeAmount = 0;
     void loadPersistedIdentity();
     void savePersistedIdentity();
+    std::vector<uint8_t> getStorageKey();
 };

@@ -15,10 +15,14 @@
   "nix": {
     "packages": {
       "build": [
-        "nlohmann_json"
+        "nlohmann_json",
+        "openssl",
+        "zstd"
       ],
       "runtime": [
-        "nlohmann_json"
+        "nlohmann_json",
+        "openssl",
+        "zstd"
       ]
     },
     "external_libraries": [
@@ -33,13 +37,18 @@
     ],
     "cmake": {
       "find_packages": [
-        "nlohmann_json"
+        "nlohmann_json",
+        "OpenSSL",
+        "zstd"
       ],
       "extra_sources": [],
       "extra_include_dirs": [
         "lib"
       ],
-      "extra_link_libraries": []
+      "extra_link_libraries": [
+        "OpenSSL::Crypto",
+        "zstd::libzstd"
+      ]
     }
   }
 }

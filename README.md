@@ -1,7 +1,5 @@
 # eCloakCore
 
-*Built by Evice Labs*
-
 **eCloak Core C++ Qt Plugin Engine** for **Logos Basecamp**, bridging the **E-Identity Stack** (`e_identity_sdk` and `e_moderation_sdk`) to the Basecamp QML frontend via C-ABI FFI.
 
 ## Architectural Overview
