@@ -10,6 +10,11 @@
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <openssl/kdf.h>
+#include <zstd.h>
 
 using json = nlohmann::json;
 
@@ -43,14 +48,14 @@ static std::string makeErrorJson(const std::string& msg) {
 
 // --- Implementation ---
 
-static std::string getIdentityFilePath() {
+static std::string getModuleDataDir() {
     // 1. Highest priority: Basecamp environment override (portable mode or custom --user-dir)
     const char* customDir = std::getenv("LOGOS_USER_DIR");
     if (customDir && std::strlen(customDir) > 0) {
         std::string base = std::string(customDir) + "/module_data/ecloakcore";
         std::error_code ec;
         std::filesystem::create_directories(base, ec);
-        return base + "/identity.json";
+        return base;
     }
 
     std::string base;
@@ -85,7 +90,235 @@ static std::string getIdentityFilePath() {
 
     std::error_code ec;
     std::filesystem::create_directories(base, ec);
-    return base + "/identity.json";
+    return base;
+}
+
+static std::string getIdentityFilePath() {
+    return getModuleDataDir() + "/identity.json";
+}
+
+static std::string getChatStoreFilePath() {
+    return getModuleDataDir() + "/chat_store.json";
+}
+
+static std::string getChatStoreEncFilePath() {
+    return getModuleDataDir() + "/chat_store.enc";
+}
+
+static std::string getBlobsDir() {
+    std::string dir = getModuleDataDir() + "/blobs";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
+static std::vector<uint8_t> base64Decode(const std::string& input) {
+    std::string clean = input;
+    auto commaPos = clean.find(',');
+    if (commaPos != std::string::npos && clean.find("base64") != std::string::npos) {
+        clean = clean.substr(commaPos + 1);
+    }
+    clean.erase(std::remove_if(clean.begin(), clean.end(), [](unsigned char c) {
+        return std::isspace(c);
+    }), clean.end());
+
+    static const std::string b64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::vector<int> T(256, -1);
+    for (int i = 0; i < 64; i++) T[b64Chars[i]] = i;
+
+    std::vector<uint8_t> out;
+    int val = 0, valb = -8;
+    for (unsigned char c : clean) {
+        if (T[c] == -1) break;
+        val = (val << 6) + T[c];
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<uint8_t>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
+static std::string base64Encode(const uint8_t* data, size_t len) {
+    static const char b64Chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    int val = 0, valb = -6;
+    for (size_t i = 0; i < len; ++i) {
+        val = (val << 8) + data[i];
+        valb += 8;
+        while (valb >= 0) {
+            out.push_back(b64Chars[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) out.push_back(b64Chars[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
+
+static std::string computeSha256Hex(const uint8_t* data, size_t len) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(data, len, hash);
+    std::ostringstream oss;
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+    }
+    return oss.str();
+}
+
+static std::vector<uint8_t> compressZstd(const std::string& input) {
+    size_t const maxDstSize = ZSTD_compressBound(input.size());
+    std::vector<uint8_t> dst(maxDstSize);
+    size_t const cSize = ZSTD_compress(dst.data(), maxDstSize, input.data(), input.size(), 3);
+    if (ZSTD_isError(cSize)) {
+        throw std::runtime_error(std::string("ZSTD compression failed: ") + ZSTD_getErrorName(cSize));
+    }
+    dst.resize(cSize);
+    return dst;
+}
+
+static std::string decompressZstd(const uint8_t* src, size_t srcSize) {
+    unsigned long long rSize = ZSTD_getFrameContentSize(src, srcSize);
+    if (rSize == ZSTD_CONTENTSIZE_ERROR) {
+        throw std::runtime_error("ZSTD frame content size error");
+    }
+    if (rSize == ZSTD_CONTENTSIZE_UNKNOWN) {
+        rSize = srcSize * 4 + 1024;
+    }
+    std::string out;
+    out.resize(rSize);
+    size_t const dSize = ZSTD_decompress(&out[0], out.size(), src, srcSize);
+    if (ZSTD_isError(dSize)) {
+        throw std::runtime_error(std::string("ZSTD decompression failed: ") + ZSTD_getErrorName(dSize));
+    }
+    out.resize(dSize);
+    return out;
+}
+
+static std::vector<uint8_t> deriveStorageKey(const uint8_t* secret, size_t secretLen) {
+    std::vector<uint8_t> key(32);
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
+    if (!pctx) {
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        std::string s(reinterpret_cast<const char*>(secret), secretLen);
+        s += "eCloak-ChatStore-v1";
+        SHA256(reinterpret_cast<const unsigned char*>(s.data()), s.size(), hash);
+        std::memcpy(key.data(), hash, 32);
+        return key;
+    }
+    if (EVP_PKEY_derive_init(pctx) <= 0 ||
+        EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_sha256()) <= 0 ||
+        EVP_PKEY_CTX_set1_hkdf_key(pctx, secret, secretLen) <= 0 ||
+        EVP_PKEY_CTX_add1_hkdf_info(pctx, (const unsigned char*)"eCloak-ChatStore-v1", 19) <= 0) {
+        EVP_PKEY_CTX_free(pctx);
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        std::string s(reinterpret_cast<const char*>(secret), secretLen);
+        s += "eCloak-ChatStore-v1";
+        SHA256(reinterpret_cast<const unsigned char*>(s.data()), s.size(), hash);
+        std::memcpy(key.data(), hash, 32);
+        return key;
+    }
+    size_t outlen = 32;
+    EVP_PKEY_derive(pctx, key.data(), &outlen);
+    EVP_PKEY_CTX_free(pctx);
+    return key;
+}
+
+static std::vector<uint8_t> encryptAes256Gcm(const std::vector<uint8_t>& key,
+                                             const std::vector<uint8_t>& plaintext) {
+    std::vector<uint8_t> iv(12);
+    if (RAND_bytes(iv.data(), 12) != 1) {
+        throw std::runtime_error("RAND_bytes failed for AES-GCM IV");
+    }
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) throw std::runtime_error("Failed to create EVP_CIPHER_CTX");
+
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1 ||
+        EVP_EncryptInit_ex(ctx, NULL, NULL, key.data(), iv.data()) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("Failed to init AES-256-GCM encrypt");
+    }
+
+    std::vector<uint8_t> ciphertext(plaintext.size());
+    int outLen = 0;
+    if (EVP_EncryptUpdate(ctx, ciphertext.data(), &outLen, plaintext.data(), plaintext.size()) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("EVP_EncryptUpdate failed");
+    }
+
+    int finalLen = 0;
+    if (EVP_EncryptFinal_ex(ctx, ciphertext.data() + outLen, &finalLen) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("EVP_EncryptFinal_ex failed");
+    }
+    ciphertext.resize(outLen + finalLen);
+
+    std::vector<uint8_t> tag(16);
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag.data()) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("Failed to get GCM tag");
+    }
+    EVP_CIPHER_CTX_free(ctx);
+
+    std::vector<uint8_t> result;
+    result.reserve(4 + 1 + 12 + 16 + ciphertext.size());
+    result.push_back('E');
+    result.push_back('C');
+    result.push_back('L');
+    result.push_back('K');
+    result.push_back(0x01);
+    result.insert(result.end(), iv.begin(), iv.end());
+    result.insert(result.end(), tag.begin(), tag.end());
+    result.insert(result.end(), ciphertext.begin(), ciphertext.end());
+    return result;
+}
+
+static std::vector<uint8_t> decryptAes256Gcm(const std::vector<uint8_t>& key,
+                                             const std::vector<uint8_t>& encData) {
+    if (encData.size() < (4 + 1 + 12 + 16)) {
+        throw std::runtime_error("Encrypted data too small");
+    }
+    if (encData[0] != 'E' || encData[1] != 'C' || encData[2] != 'L' || encData[3] != 'K' || encData[4] != 0x01) {
+        throw std::runtime_error("Invalid file magic or version");
+    }
+    const uint8_t* iv = encData.data() + 5;
+    const uint8_t* tag = encData.data() + 5 + 12;
+    const uint8_t* ciphertext = encData.data() + 5 + 12 + 16;
+    size_t cipherLen = encData.size() - (5 + 12 + 16);
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) throw std::runtime_error("Failed to create EVP_CIPHER_CTX");
+
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1 ||
+        EVP_DecryptInit_ex(ctx, NULL, NULL, key.data(), iv) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("Failed to init AES-256-GCM decrypt");
+    }
+
+    std::vector<uint8_t> plaintext(cipherLen);
+    int outLen = 0;
+    if (EVP_DecryptUpdate(ctx, plaintext.data(), &outLen, ciphertext, cipherLen) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("EVP_DecryptUpdate failed");
+    }
+
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, const_cast<uint8_t*>(tag)) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw std::runtime_error("Failed to set GCM tag");
+    }
+
+    int finalLen = 0;
+    int ret = EVP_DecryptFinal_ex(ctx, plaintext.data() + outLen, &finalLen);
+    EVP_CIPHER_CTX_free(ctx);
+    if (ret <= 0) {
+        throw std::runtime_error("AES-256-GCM authentication failed: data corrupted or wrong key");
+    }
+    plaintext.resize(outLen + finalLen);
+    return plaintext;
 }
 
 ElAnonChatCoreImpl::ElAnonChatCoreImpl()
@@ -708,6 +941,16 @@ std::string ElAnonChatCoreImpl::preparePost(const std::string& message,
         if (!res) return makeErrorJson("failed to prepare post");
         std::string out(res);
         ffi_free_string(res);
+
+        try {
+            json postJ = json::parse(out);
+            if (postJ.contains("tracing_tag") && postJ["tracing_tag"].is_array()) {
+                std::vector<uint8_t> tagBytes = postJ["tracing_tag"].get<std::vector<uint8_t>>();
+                postJ["tracing_tag"] = bytesToHex(tagBytes.data(), tagBytes.size());
+                return postJ.dump();
+            }
+        } catch (...) {}
+
         return out;
     } catch (const std::exception& e) {
         return makeErrorJson(e.what());
@@ -849,4 +1092,209 @@ std::string ElAnonChatCoreImpl::revokeCommitment(const std::string& commitmentHe
     std::string out(res);
     ffi_identity_free_string(res);
     return out;
+}
+
+
+// ---------------------------------------------------------------------------
+// Persistent Chat Store Operations (AES-256-GCM + Zstd) & Blob Storage
+// ---------------------------------------------------------------------------
+
+std::vector<uint8_t> ElAnonChatCoreImpl::getStorageKey()
+{
+    loadPersistedIdentity();
+    if (m_registration) {
+        uint8_t nsk[32];
+        ffi_registration_nsk(m_registration, nsk);
+        return deriveStorageKey(nsk, 32);
+    }
+    static const uint8_t fallbackSeed[32] = {
+        0x65, 0x43, 0x6c, 0x6f, 0x61, 0x6b, 0x53, 0x74,
+        0x6f, 0x72, 0x61, 0x67, 0x65, 0x53, 0x65, 0x65,
+        0x64, 0x5f, 0x44, 0x65, 0x66, 0x61, 0x75, 0x6c,
+        0x74, 0x5f, 0x56, 0x31, 0x30, 0x30, 0x21, 0x23
+    };
+    return deriveStorageKey(fallbackSeed, 32);
+}
+
+std::string ElAnonChatCoreImpl::saveBlob(const std::string& base64Data,
+                                         const std::string& fileName,
+                                         const std::string& mimeType)
+{
+    try {
+        if (base64Data.empty()) {
+            return makeErrorJson("Blob payload cannot be empty");
+        }
+        std::vector<uint8_t> raw = base64Decode(base64Data);
+        if (raw.empty()) {
+            return makeErrorJson("Failed to decode base64 blob data");
+        }
+
+        std::string blobId = computeSha256Hex(raw.data(), raw.size());
+        std::string blobsDir = getBlobsDir();
+        std::string targetPath = blobsDir + "/" + blobId;
+
+        // Content-addressed: only write if not already stored
+        if (!std::filesystem::exists(targetPath)) {
+            std::string tmpPath = targetPath + ".tmp";
+            {
+                std::ofstream out(tmpPath, std::ios::binary);
+                if (!out.is_open()) {
+                    return makeErrorJson("Failed to open temporary file for blob");
+                }
+                out.write(reinterpret_cast<const char*>(raw.data()), raw.size());
+            }
+            std::error_code ec;
+            std::filesystem::rename(tmpPath, targetPath, ec);
+            if (ec) {
+                std::filesystem::copy_file(tmpPath, targetPath, std::filesystem::copy_options::overwrite_existing, ec);
+                std::filesystem::remove(tmpPath, ec);
+            }
+        }
+
+        json res;
+        res["ok"] = true;
+        res["blobId"] = blobId;
+        res["fileName"] = fileName;
+        res["fileSize"] = raw.size();
+        res["mimeType"] = mimeType;
+        res["localPath"] = targetPath;
+        return res.dump();
+    } catch (const std::exception& e) {
+        return makeErrorJson(std::string("Error saving blob: ") + e.what());
+    }
+}
+
+std::string ElAnonChatCoreImpl::loadBlob(const std::string& blobId)
+{
+    try {
+        if (blobId.empty()) return "";
+        std::string targetPath = getBlobsDir() + "/" + blobId;
+        if (!std::filesystem::exists(targetPath)) {
+            return "";
+        }
+        std::ifstream in(targetPath, std::ios::binary | std::ios::ate);
+        if (!in.is_open()) return "";
+        std::streamsize size = in.tellg();
+        in.seekg(0, std::ios::beg);
+        std::vector<uint8_t> buffer(size);
+        if (!in.read(reinterpret_cast<char*>(buffer.data()), size)) {
+            return "";
+        }
+        return base64Encode(buffer.data(), buffer.size());
+    } catch (...) {
+        return "";
+    }
+}
+
+std::string ElAnonChatCoreImpl::getBlobPath(const std::string& blobId)
+{
+    if (blobId.empty()) return "";
+    return getBlobsDir() + "/" + blobId;
+}
+
+std::string ElAnonChatCoreImpl::saveChatStore(const std::string& chatStoreJson)
+{
+    try {
+        // Validate valid JSON
+        auto parsed = json::parse(chatStoreJson);
+        std::string serialized = parsed.dump();
+
+        // 1. Zstd Compression
+        std::vector<uint8_t> compressed = compressZstd(serialized);
+
+        // 2. Derive Encryption Key
+        std::vector<uint8_t> key = getStorageKey();
+
+        // 3. AES-256-GCM Authenticated Encryption
+        std::vector<uint8_t> encrypted = encryptAes256Gcm(key, compressed);
+
+        // 4. Atomic file write
+        std::string encPath = getChatStoreEncFilePath();
+        std::string tmpPath = encPath + ".tmp";
+        {
+            std::ofstream file(tmpPath, std::ios::binary);
+            if (!file.is_open()) {
+                return makeErrorJson("Failed to open temporary file for writing encrypted chat store");
+            }
+            file.write(reinterpret_cast<const char*>(encrypted.data()), encrypted.size());
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmpPath, encPath, ec);
+        if (ec) {
+            std::filesystem::copy_file(tmpPath, encPath, std::filesystem::copy_options::overwrite_existing, ec);
+            std::filesystem::remove(tmpPath, ec);
+        }
+
+        // Clean up legacy unencrypted chat_store.json if present
+        std::string legacyPath = getChatStoreFilePath();
+        if (std::filesystem::exists(legacyPath)) {
+            std::filesystem::remove(legacyPath, ec);
+        }
+
+        json res;
+        res["ok"] = true;
+        res["encrypted"] = true;
+        res["compressed"] = true;
+        res["storedBytes"] = encrypted.size();
+        return res.dump();
+    } catch (const std::exception& e) {
+        return makeErrorJson(std::string("Error saving chat store: ") + e.what());
+    }
+}
+
+std::string ElAnonChatCoreImpl::loadChatStore()
+{
+    try {
+        std::string encPath = getChatStoreEncFilePath();
+        if (std::filesystem::exists(encPath)) {
+            std::ifstream file(encPath, std::ios::binary | std::ios::ate);
+            if (file.is_open()) {
+                std::streamsize size = file.tellg();
+                file.seekg(0, std::ios::beg);
+                std::vector<uint8_t> encData(size);
+                if (file.read(reinterpret_cast<char*>(encData.data()), size)) {
+                    std::vector<uint8_t> key = getStorageKey();
+                    std::vector<uint8_t> compressed = decryptAes256Gcm(key, encData);
+                    std::string jsonStr = decompressZstd(compressed.data(), compressed.size());
+                    auto j = json::parse(jsonStr);
+                    return j.dump();
+                }
+            }
+        }
+
+        // Backward compatibility fallback to unencrypted chat_store.json
+        std::string legacyPath = getChatStoreFilePath();
+        if (std::filesystem::exists(legacyPath)) {
+            std::ifstream file(legacyPath);
+            if (file.is_open()) {
+                json j;
+                file >> j;
+                return j.dump();
+            }
+        }
+
+        return "{}";
+    } catch (...) {
+        return "{}";
+    }
+}
+
+std::string ElAnonChatCoreImpl::clearChatStore()
+{
+    try {
+        std::error_code ec;
+        std::string encPath = getChatStoreEncFilePath();
+        if (std::filesystem::exists(encPath)) {
+            std::filesystem::remove(encPath, ec);
+        }
+        std::string legacyPath = getChatStoreFilePath();
+        if (std::filesystem::exists(legacyPath)) {
+            std::filesystem::remove(legacyPath, ec);
+        }
+        json res;
+        res["ok"] = true;
+        return res.dump();
+    } catch (...) {
+        return makeErrorJson("Failed to clear chat store");
+    }
 }
