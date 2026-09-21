@@ -22,11 +22,11 @@ struct FfiSlashAggregator;
  * The Qt plugin glue and QML bindings are generated automatically by logos-module-builder.
  * All integer types in the public interface must be 64-bit (uint64_t or int64_t) for LIDL compatibility.
  */
-class ElAnonChatCoreImpl : public LogosModuleContext
+class ECloakCoreImpl : public LogosModuleContext
 {
 public:
-    ElAnonChatCoreImpl();
-    ~ElAnonChatCoreImpl() override;
+    ECloakCoreImpl();
+    ~ECloakCoreImpl() override;
 
     // --- Identity Operations ---
     std::string createIdentity(const std::string& nskHex);

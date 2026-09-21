@@ -1,29 +1,21 @@
 {
-  "name": "ecloakcore",
-  "display_name": "eCloak Core",
+  "name": "e_cloak_core",
+  "display_name": "e-cloak-core",
   "version": "1.0.0",
   "type": "core",
   "interface": "universal",
   "category": "general",
-  "description": "eCloak Core C++ Qt Plugin and cryptographic engine by Evice Labs",
-  "main": "ecloakcore_plugin",
+  "description": "C++ Qt Plugin and cryptographic engine powered by e-identity-stack",
+  "main": "e_cloak_core_plugin",
   "codegen": {
-    "impl_header": "src/el_anon_chat_core_impl.h",
-    "impl_class": "ElAnonChatCoreImpl"
+    "impl_header": "src/e_cloak_core_impl.h",
+    "impl_class": "ECloakCoreImpl"
   },
   "dependencies": [],
   "nix": {
     "packages": {
-      "build": [
-        "nlohmann_json",
-        "openssl",
-        "zstd"
-      ],
-      "runtime": [
-        "nlohmann_json",
-        "openssl",
-        "zstd"
-      ]
+      "build": ["nlohmann_json", "openssl", "zstd"],
+      "runtime": ["nlohmann_json", "openssl", "zstd"]
     },
     "external_libraries": [
       {
@@ -36,19 +28,10 @@
       }
     ],
     "cmake": {
-      "find_packages": [
-        "nlohmann_json",
-        "OpenSSL",
-        "zstd"
-      ],
+      "find_packages": ["nlohmann_json", "OpenSSL", "zstd"],
       "extra_sources": [],
-      "extra_include_dirs": [
-        "lib"
-      ],
-      "extra_link_libraries": [
-        "OpenSSL::Crypto",
-        "zstd::libzstd"
-      ]
+      "extra_include_dirs": ["lib"],
+      "extra_link_libraries": ["OpenSSL::Crypto", "zstd::libzstd"]
     }
   }
 }
