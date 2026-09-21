@@ -1,4 +1,4 @@
-#include "el_anon_chat_core_impl.h"
+#include "e_cloak_core_impl.h"
 #include "../lib/e_identity_sdk.h"
 #include "../lib/e_moderation_sdk.h"
 
@@ -21,11 +21,19 @@ using json = nlohmann::json;
 // --- Internal Helper Functions ---
 
 static std::vector<uint8_t> hexToBytes(const std::string& hex) {
+    std::string s = hex;
+    if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) {
+        s = s.substr(2);
+    }
     std::vector<uint8_t> bytes;
-    for (size_t i = 0; i < hex.length(); i += 2) {
-        if (i + 1 < hex.length()) {
-            uint8_t byte = static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16));
-            bytes.push_back(byte);
+    for (size_t i = 0; i < s.length(); i += 2) {
+        if (i + 1 < s.length()) {
+            try {
+                uint8_t byte = static_cast<uint8_t>(std::stoul(s.substr(i, 2), nullptr, 16));
+                bytes.push_back(byte);
+            } catch (...) {
+                return {};
+            }
         }
     }
     return bytes;
@@ -49,48 +57,60 @@ static std::string makeErrorJson(const std::string& msg) {
 // --- Implementation ---
 
 static std::string getModuleDataDir() {
-    // 1. Highest priority: Basecamp environment override (portable mode or custom --user-dir)
+    std::string root;
     const char* customDir = std::getenv("LOGOS_USER_DIR");
     if (customDir && std::strlen(customDir) > 0) {
-        std::string base = std::string(customDir) + "/module_data/ecloakcore";
-        std::error_code ec;
-        std::filesystem::create_directories(base, ec);
-        return base;
-    }
-
-    std::string base;
+        root = std::string(customDir) + "/module_data";
+    } else {
 #if defined(_WIN32)
-    const char* appData = std::getenv("APPDATA");
-    if (appData && std::strlen(appData) > 0) {
-        base = std::string(appData) + "/Logos/LogosBasecamp/module_data/ecloakcore";
-    } else {
-        base = "C:/LogosBasecamp/module_data/ecloakcore";
-    }
+        const char* appData = std::getenv("APPDATA");
+        if (appData && std::strlen(appData) > 0) {
+            root = std::string(appData) + "/Logos/LogosBasecamp/module_data";
+        } else {
+            root = "C:/LogosBasecamp/module_data";
+        }
 #elif defined(__APPLE__)
-    const char* home = std::getenv("HOME");
-    if (home && std::strlen(home) > 0) {
-        base = std::string(home) + "/Library/Application Support/Logos/LogosBasecamp/module_data/ecloakcore";
-    } else {
-        base = "/tmp/ecloakcore";
-    }
-#else
-    // Linux and Unix-like OS (follows XDG Base Directory specification)
-    const char* xdgData = std::getenv("XDG_DATA_HOME");
-    if (xdgData && std::strlen(xdgData) > 0) {
-        base = std::string(xdgData) + "/Logos/LogosBasecamp/module_data/ecloakcore";
-    } else {
         const char* home = std::getenv("HOME");
         if (home && std::strlen(home) > 0) {
-            base = std::string(home) + "/.local/share/Logos/LogosBasecamp/module_data/ecloakcore";
+            root = std::string(home) + "/Library/Application Support/Logos/LogosBasecamp/module_data";
         } else {
-            base = "/tmp/ecloakcore";
+            root = "/tmp";
         }
-    }
+#else
+        const char* xdgData = std::getenv("XDG_DATA_HOME");
+        if (xdgData && std::strlen(xdgData) > 0) {
+            root = std::string(xdgData) + "/Logos/LogosBasecamp/module_data";
+        } else {
+            const char* home = std::getenv("HOME");
+            if (home && std::strlen(home) > 0) {
+                root = std::string(home) + "/.local/share/Logos/LogosBasecamp/module_data";
+            } else {
+                root = "/tmp";
+            }
+        }
 #endif
+    }
+
+    std::string newBase = root + "/e-cloak-core";
+    std::string oldBase = root + "/ecloakcore";
 
     std::error_code ec;
-    std::filesystem::create_directories(base, ec);
-    return base;
+    std::filesystem::create_directories(newBase, ec);
+
+    // Backward compatibility: If old data dir exists and new does not have files yet, migrate them
+    if (std::filesystem::exists(oldBase, ec)) {
+        if (!std::filesystem::exists(newBase + "/identity.json", ec) && std::filesystem::exists(oldBase + "/identity.json", ec)) {
+            std::filesystem::copy_file(oldBase + "/identity.json", newBase + "/identity.json", std::filesystem::copy_options::skip_existing, ec);
+        }
+        if (!std::filesystem::exists(newBase + "/chat_store.enc", ec) && std::filesystem::exists(oldBase + "/chat_store.enc", ec)) {
+            std::filesystem::copy_file(oldBase + "/chat_store.enc", newBase + "/chat_store.enc", std::filesystem::copy_options::skip_existing, ec);
+        }
+        if (!std::filesystem::exists(newBase + "/chat_store.json", ec) && std::filesystem::exists(oldBase + "/chat_store.json", ec)) {
+            std::filesystem::copy_file(oldBase + "/chat_store.json", newBase + "/chat_store.json", std::filesystem::copy_options::skip_existing, ec);
+        }
+    }
+
+    return newBase;
 }
 
 static std::string getIdentityFilePath() {
@@ -321,7 +341,7 @@ static std::vector<uint8_t> decryptAes256Gcm(const std::vector<uint8_t>& key,
     return plaintext;
 }
 
-ElAnonChatCoreImpl::ElAnonChatCoreImpl()
+ECloakCoreImpl::ECloakCoreImpl()
 {
     m_usernameRegistry = ffi_username_registry_new();
     m_roomRegistry = ffi_room_registry_new();
@@ -330,7 +350,7 @@ ElAnonChatCoreImpl::ElAnonChatCoreImpl()
     loadPersistedIdentity();
 }
 
-ElAnonChatCoreImpl::~ElAnonChatCoreImpl()
+ECloakCoreImpl::~ECloakCoreImpl()
 {
     if (m_registration) ffi_registration_free(m_registration);
     if (m_usernameRegistry) ffi_username_registry_free(m_usernameRegistry);
@@ -346,7 +366,7 @@ ElAnonChatCoreImpl::~ElAnonChatCoreImpl()
 // Identity Operations
 // ---------------------------------------------------------------------------
 
-void ElAnonChatCoreImpl::loadPersistedIdentity()
+void ECloakCoreImpl::loadPersistedIdentity()
 {
     try {
         std::string path = getIdentityFilePath();
@@ -382,7 +402,7 @@ void ElAnonChatCoreImpl::loadPersistedIdentity()
     } catch (...) {}
 }
 
-void ElAnonChatCoreImpl::savePersistedIdentity()
+void ECloakCoreImpl::savePersistedIdentity()
 {
     if (!m_registration) return;
     try {
@@ -406,7 +426,7 @@ void ElAnonChatCoreImpl::savePersistedIdentity()
     } catch (...) {}
 }
 
-std::string ElAnonChatCoreImpl::getIdentityInfo()
+std::string ECloakCoreImpl::getIdentityInfo()
 {
     json res;
     if (!m_registration) {
@@ -430,7 +450,7 @@ std::string ElAnonChatCoreImpl::getIdentityInfo()
     return res.dump();
 }
 
-std::string ElAnonChatCoreImpl::getNetworkStatus()
+std::string ECloakCoreImpl::getNetworkStatus()
 {
     json res;
     res["connected"] = true;
@@ -451,7 +471,7 @@ std::string ElAnonChatCoreImpl::getNetworkStatus()
     return res.dump();
 }
 
-std::string ElAnonChatCoreImpl::recordStake(uint64_t amount)
+std::string ECloakCoreImpl::recordStake(uint64_t amount)
 {
     if (!m_registration) return makeErrorJson("No active identity to stake for");
     m_staked = true;
@@ -464,7 +484,7 @@ std::string ElAnonChatCoreImpl::recordStake(uint64_t amount)
     return j.dump();
 }
 
-std::string ElAnonChatCoreImpl::createIdentity(const std::string& nskHex)
+std::string ECloakCoreImpl::createIdentity(const std::string& nskHex)
 {
     // Anti-Bypass Guard: Prevent regeneration if an active unrevoked identity already exists
     if (m_registration != nullptr) {
@@ -511,7 +531,7 @@ std::string ElAnonChatCoreImpl::createIdentity(const std::string& nskHex)
     return res.dump();
 }
 
-std::string ElAnonChatCoreImpl::getCommitment()
+std::string ECloakCoreImpl::getCommitment()
 {
     if (!m_registration) return "";
     uint8_t comm[32];
@@ -519,12 +539,12 @@ std::string ElAnonChatCoreImpl::getCommitment()
     return bytesToHex(comm, 32);
 }
 
-bool ElAnonChatCoreImpl::hasActiveIdentity()
+bool ECloakCoreImpl::hasActiveIdentity()
 {
     return m_registration != nullptr;
 }
 
-std::string ElAnonChatCoreImpl::getSchnorrPublicKey()
+std::string ECloakCoreImpl::getSchnorrPublicKey()
 {
     if (!m_registration) return "";
     uint8_t nsk[32];
@@ -537,7 +557,7 @@ std::string ElAnonChatCoreImpl::getSchnorrPublicKey()
     return bytesToHex(pub, 32);
 }
 
-std::string ElAnonChatCoreImpl::prepareRegistration(const std::string& username,
+std::string ECloakCoreImpl::prepareRegistration(const std::string& username,
                                                     uint64_t kSssThreshold,
                                                     const std::string& nodePubkeysJson)
 {
@@ -584,11 +604,19 @@ std::string ElAnonChatCoreImpl::prepareRegistration(const std::string& username,
     }
 }
 
-std::string ElAnonChatCoreImpl::registerUsername(const std::string& username)
+std::string ECloakCoreImpl::registerUsername(const std::string& username)
 {
     if (!m_registration) return makeErrorJson("identity not initialized — generate or restore identity first");
     if (!m_usernameRegistry) return makeErrorJson("username registry not initialized");
     if (username.empty()) return makeErrorJson("username cannot be empty");
+    if (username.length() < 3 || username.length() > 32) {
+        return makeErrorJson("Username must be between 3 and 32 characters");
+    }
+    for (char c : username) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') {
+            return makeErrorJson("Username can only contain alphanumeric characters and underscores");
+        }
+    }
 
     uint8_t comm[32];
     ffi_registration_commitment(m_registration, comm);
@@ -632,7 +660,7 @@ std::string ElAnonChatCoreImpl::registerUsername(const std::string& username)
     return out;
 }
 
-std::string ElAnonChatCoreImpl::lookupUsername(const std::string& commitmentHex)
+std::string ECloakCoreImpl::lookupUsername(const std::string& commitmentHex)
 {
     if (!m_usernameRegistry) return "";
     std::vector<uint8_t> comm = hexToBytes(commitmentHex);
@@ -649,7 +677,7 @@ std::string ElAnonChatCoreImpl::lookupUsername(const std::string& commitmentHex)
 // Room Operations
 // ---------------------------------------------------------------------------
 
-std::string ElAnonChatCoreImpl::createRoom(const std::string& adminCommitmentHex,
+std::string ECloakCoreImpl::createRoom(const std::string& adminCommitmentHex,
                                            uint64_t nThreshold,
                                            uint64_t mTotal,
                                            const std::string& moderatorPubkeysJson,
@@ -719,7 +747,7 @@ std::string ElAnonChatCoreImpl::createRoom(const std::string& adminCommitmentHex
     }
 }
 
-std::string ElAnonChatCoreImpl::signRoomConsent(const std::string& roomIdHex)
+std::string ECloakCoreImpl::signRoomConsent(const std::string& roomIdHex)
 {
     if (!m_registration) return makeErrorJson("identity not initialized — generate or restore identity first");
 
@@ -738,7 +766,7 @@ std::string ElAnonChatCoreImpl::signRoomConsent(const std::string& roomIdHex)
     return out;
 }
 
-std::string ElAnonChatCoreImpl::joinRoom(const std::string& roomIdHex,
+std::string ECloakCoreImpl::joinRoom(const std::string& roomIdHex,
                                          const std::string& memberCommitmentHex,
                                          const std::string& memberPubkeyHex,
                                          const std::string& consentSignatureHex,
@@ -830,7 +858,7 @@ std::string ElAnonChatCoreImpl::joinRoom(const std::string& roomIdHex,
     return out;
 }
 
-std::string ElAnonChatCoreImpl::leaveRoom(const std::string& roomIdHex, const std::string& memberCommitmentHex)
+std::string ECloakCoreImpl::leaveRoom(const std::string& roomIdHex, const std::string& memberCommitmentHex)
 {
     if (!m_registration) return makeErrorJson("identity not initialized — generate or restore identity first");
 
@@ -861,7 +889,7 @@ std::string ElAnonChatCoreImpl::leaveRoom(const std::string& roomIdHex, const st
     return out;
 }
 
-int64_t ElAnonChatCoreImpl::getRoomMemberCount(const std::string& roomIdHex)
+int64_t ECloakCoreImpl::getRoomMemberCount(const std::string& roomIdHex)
 {
     if (!m_roomRegistry) return 0;
     std::vector<uint8_t> roomId = hexToBytes(roomIdHex);
@@ -869,7 +897,7 @@ int64_t ElAnonChatCoreImpl::getRoomMemberCount(const std::string& roomIdHex)
     return static_cast<int64_t>(ffi_room_registry_active_member_count(m_roomRegistry, roomId.data()));
 }
 
-bool ElAnonChatCoreImpl::isRoomMember(const std::string& roomIdHex, const std::string& memberCommitmentHex)
+bool ECloakCoreImpl::isRoomMember(const std::string& roomIdHex, const std::string& memberCommitmentHex)
 {
     if (!m_roomRegistry) return false;
     std::vector<uint8_t> roomId = hexToBytes(roomIdHex);
@@ -882,7 +910,7 @@ bool ElAnonChatCoreImpl::isRoomMember(const std::string& roomIdHex, const std::s
 // Chat & Messaging Operations (Two-Tier SSS)
 // ---------------------------------------------------------------------------
 
-std::string ElAnonChatCoreImpl::preparePost(const std::string& message,
+std::string ECloakCoreImpl::preparePost(const std::string& message,
                                             const std::string& postSaltHex,
                                             const std::string& moderatorPubkeysJson,
                                             int64_t nThreshold)
@@ -961,7 +989,7 @@ std::string ElAnonChatCoreImpl::preparePost(const std::string& message,
 // Moderation Operations
 // ---------------------------------------------------------------------------
 
-std::string ElAnonChatCoreImpl::createModerator(const std::string& privkeyHex)
+std::string ECloakCoreImpl::createModerator(const std::string& privkeyHex)
 {
     if (m_moderator) { ffi_moderator_free(m_moderator); m_moderator = nullptr; }
     std::vector<uint8_t> priv = hexToBytes(privkeyHex);
@@ -975,7 +1003,7 @@ std::string ElAnonChatCoreImpl::createModerator(const std::string& privkeyHex)
     return j.dump();
 }
 
-std::string ElAnonChatCoreImpl::getModeratorPubkey()
+std::string ECloakCoreImpl::getModeratorPubkey()
 {
     if (!m_moderator) return "";
     uint8_t pub[32];
@@ -983,7 +1011,7 @@ std::string ElAnonChatCoreImpl::getModeratorPubkey()
     return bytesToHex(pub, 32);
 }
 
-std::string ElAnonChatCoreImpl::issueStrike(const std::string& /*roomIdHex*/,
+std::string ECloakCoreImpl::issueStrike(const std::string& /*roomIdHex*/,
                                             const std::string& /*targetCommitmentHex*/,
                                             const std::string& /*evidenceHashHex*/,
                                             const std::string& tracingTagHex,
@@ -1007,7 +1035,7 @@ std::string ElAnonChatCoreImpl::issueStrike(const std::string& /*roomIdHex*/,
     return out;
 }
 
-std::string ElAnonChatCoreImpl::validateStrike(const std::string& certificateJson, int64_t nThreshold)
+std::string ECloakCoreImpl::validateStrike(const std::string& certificateJson, int64_t nThreshold)
 {
     if (!m_moderatorRegistry) return makeErrorJson("moderator registry not initialized");
     char* res = ffi_strike_validate(certificateJson.c_str(), static_cast<uint32_t>(nThreshold), m_moderatorRegistry);
@@ -1021,7 +1049,7 @@ std::string ElAnonChatCoreImpl::validateStrike(const std::string& certificateJso
 // Slashing & Reconstruction
 // ---------------------------------------------------------------------------
 
-std::string ElAnonChatCoreImpl::createAggregator(int64_t nThreshold, int64_t kStrikes, const std::string& moderatorPubkeysJson)
+std::string ECloakCoreImpl::createAggregator(int64_t nThreshold, int64_t kStrikes, const std::string& moderatorPubkeysJson)
 {
     if (m_aggregator) { ffi_aggregator_free(m_aggregator); m_aggregator = nullptr; }
 
@@ -1049,7 +1077,7 @@ std::string ElAnonChatCoreImpl::createAggregator(int64_t nThreshold, int64_t kSt
     }
 }
 
-std::string ElAnonChatCoreImpl::reconstructStrike(const std::string& tracingTagHex, const std::string& certificatesJson)
+std::string ECloakCoreImpl::reconstructStrike(const std::string& tracingTagHex, const std::string& certificatesJson)
 {
     if (!m_aggregator) return makeErrorJson("aggregator not initialized");
     std::vector<uint8_t> tag = hexToBytes(tracingTagHex);
@@ -1064,7 +1092,7 @@ std::string ElAnonChatCoreImpl::reconstructStrike(const std::string& tracingTagH
     return out;
 }
 
-std::string ElAnonChatCoreImpl::reconstructNsk(const std::string& strikesJson)
+std::string ECloakCoreImpl::reconstructNsk(const std::string& strikesJson)
 {
     if (!m_aggregator) return makeErrorJson("aggregator not initialized");
     char* res = ffi_aggregator_reconstruct_nsk(m_aggregator, strikesJson.c_str());
@@ -1074,7 +1102,7 @@ std::string ElAnonChatCoreImpl::reconstructNsk(const std::string& strikesJson)
     return out;
 }
 
-bool ElAnonChatCoreImpl::isRevoked(const std::string& commitmentHex)
+bool ECloakCoreImpl::isRevoked(const std::string& commitmentHex)
 {
     if (!m_blacklist) return false;
     std::vector<uint8_t> comm = hexToBytes(commitmentHex);
@@ -1082,7 +1110,7 @@ bool ElAnonChatCoreImpl::isRevoked(const std::string& commitmentHex)
     return ffi_blacklist_is_revoked(m_blacklist, comm.data()) == 1;
 }
 
-std::string ElAnonChatCoreImpl::revokeCommitment(const std::string& commitmentHex)
+std::string ECloakCoreImpl::revokeCommitment(const std::string& commitmentHex)
 {
     if (!m_blacklist) return makeErrorJson("blacklist not initialized");
     std::vector<uint8_t> comm = hexToBytes(commitmentHex);
@@ -1099,7 +1127,7 @@ std::string ElAnonChatCoreImpl::revokeCommitment(const std::string& commitmentHe
 // Persistent Chat Store Operations (AES-256-GCM + Zstd) & Blob Storage
 // ---------------------------------------------------------------------------
 
-std::vector<uint8_t> ElAnonChatCoreImpl::getStorageKey()
+std::vector<uint8_t> ECloakCoreImpl::getStorageKey()
 {
     loadPersistedIdentity();
     if (m_registration) {
@@ -1116,7 +1144,7 @@ std::vector<uint8_t> ElAnonChatCoreImpl::getStorageKey()
     return deriveStorageKey(fallbackSeed, 32);
 }
 
-std::string ElAnonChatCoreImpl::saveBlob(const std::string& base64Data,
+std::string ECloakCoreImpl::saveBlob(const std::string& base64Data,
                                          const std::string& fileName,
                                          const std::string& mimeType)
 {
@@ -1164,7 +1192,7 @@ std::string ElAnonChatCoreImpl::saveBlob(const std::string& base64Data,
     }
 }
 
-std::string ElAnonChatCoreImpl::loadBlob(const std::string& blobId)
+std::string ECloakCoreImpl::loadBlob(const std::string& blobId)
 {
     try {
         if (blobId.empty()) return "";
@@ -1186,13 +1214,13 @@ std::string ElAnonChatCoreImpl::loadBlob(const std::string& blobId)
     }
 }
 
-std::string ElAnonChatCoreImpl::getBlobPath(const std::string& blobId)
+std::string ECloakCoreImpl::getBlobPath(const std::string& blobId)
 {
     if (blobId.empty()) return "";
     return getBlobsDir() + "/" + blobId;
 }
 
-std::string ElAnonChatCoreImpl::saveChatStore(const std::string& chatStoreJson)
+std::string ECloakCoreImpl::saveChatStore(const std::string& chatStoreJson)
 {
     try {
         // Validate valid JSON
@@ -1242,7 +1270,7 @@ std::string ElAnonChatCoreImpl::saveChatStore(const std::string& chatStoreJson)
     }
 }
 
-std::string ElAnonChatCoreImpl::loadChatStore()
+std::string ECloakCoreImpl::loadChatStore()
 {
     try {
         std::string encPath = getChatStoreEncFilePath();
@@ -1279,7 +1307,7 @@ std::string ElAnonChatCoreImpl::loadChatStore()
     }
 }
 
-std::string ElAnonChatCoreImpl::clearChatStore()
+std::string ECloakCoreImpl::clearChatStore()
 {
     try {
         std::error_code ec;
