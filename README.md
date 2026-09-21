@@ -1,10 +1,10 @@
-# eCloakCore
+# Evice Cloak Core
 
-**eCloak Core C++ Qt Plugin Engine** for **Logos Basecamp**, bridging the **E-Identity Stack** (`e_identity_sdk` and `e_moderation_sdk`) to the Basecamp QML frontend via C-ABI FFI.
+**e-cloak-core** is the native C++ Qt Plugin Engine for **Logos Basecamp**, bridging the **e-identity-stack** (`e_identity_sdk` and `e_moderation_sdk`) to the **e-cloak** QML frontend via C-ABI FFI and Basecamp IPC.
 
 ## Architectural Overview
 
-`el-anon-chat-core` () implements the `PluginInterface` and exposes `AnonChatInterface` to Basecamp, providing native cryptographic capabilities:
+`e-cloak-core` implements the core backend service and exposes cryptographic and storage APIs to Basecamp:
 
 1. **Identity Management**:
    - Random and deterministic Nullifier Secret Key (NSK) derivation.
@@ -31,33 +31,38 @@
    - Tier-2 full NSK reconstruction from K accumulated strikes.
    - Identity commitment blacklisting.
 
+6. **Encrypted Blob & Chat Storage**:
+   - High-performance Zstandard compression (`ZSTD_compress`).
+   - Authenticated encryption via OpenSSL AES-256-GCM.
+   - Key derivation using SHA-256 from user's Nullifier Secret Key (NSK).
+   - Storage path under `module_data/e-cloak-core` with automatic backward-compatibility migration from `module_data/ecloakcore`.
+
 ## Directory Structure
 
 ```
-eCloakCore/
+e-cloak-core/
 ├── LICENSE                 # Business Source License 1.1 (BSL 1.1)
 ├── CMakeLists.txt          # CMake plugin build script (logos_module)
-├── metadata.json           # Basecamp core module manifest
+├── metadata.json           # Basecamp core module manifest (e_cloak_core / e-cloak-core)
 ├── flake.nix               # Nix packaging definition
 ├── README.md               # Architecture and integration documentation
-├── lib/                    # Vendor FFI binaries & headers
-│   ├── e_identity_sdk.h
-│   ├── e_moderation_sdk.h
+├── lib/                    # Vendor FFI binaries & headers from e-identity-stack
+│   ├── e_identity_sdk.h    # Cryptographic identity & vault headers
+│   ├── e_moderation_sdk.h  # GF(2^8) & Shamir Secret Sharing headers
 │   ├── libe_identity_sdk.so
 │   └── libe_moderation_sdk.so
 └── src/
-    ├── anon_chat_interface.h  # Qt Plugin Interface definition
-    ├── anon_chat_plugin.h     # QObject Plugin declaration
-    └── anon_chat_plugin.cpp   # Implementation bridging Qt/QML to Rust FFI
+    ├── e_cloak_core_impl.h    # Core module implementation header
+    └── e_cloak_core_impl.cpp  # Implementation bridging Qt/QML to Rust FFI & encrypted storage
 ```
 
 ## Build Instructions
 
 Using Nix with Logos Module Builder:
+
 ```bash
 nix build .#
 ```
-
 
 ## License
 
