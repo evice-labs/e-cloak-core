@@ -14,8 +14,16 @@
   "dependencies": [],
   "nix": {
     "packages": {
-      "build": ["nlohmann_json", "openssl", "zstd"],
-      "runtime": ["nlohmann_json", "openssl", "zstd"]
+      "build": [
+        "nlohmann_json",
+        "openssl",
+        "zstd"
+      ],
+      "runtime": [
+        "nlohmann_json",
+        "openssl",
+        "zstd"
+      ]
     },
     "external_libraries": [
       {
@@ -25,13 +33,26 @@
       {
         "name": "e_moderation_sdk",
         "vendor_path": "lib"
+      },
+      {
+        "name": "e_chat_bridge",
+        "vendor_path": "lib"
       }
     ],
     "cmake": {
-      "find_packages": ["nlohmann_json", "OpenSSL", "zstd"],
+      "find_packages": [
+        "nlohmann_json",
+        "OpenSSL",
+        "zstd"
+      ],
       "extra_sources": [],
-      "extra_include_dirs": ["lib"],
-      "extra_link_libraries": ["OpenSSL::Crypto", "zstd::libzstd"]
+      "extra_include_dirs": [
+        "lib"
+      ],
+      "extra_link_libraries": [
+        "OpenSSL::Crypto",
+        "zstd::libzstd"
+      ]
     }
   }
 }

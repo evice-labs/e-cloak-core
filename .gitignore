@@ -3,3 +3,4 @@ result
 generated_code/
 .lock*
 /target
+lib/liblogosdelivery.so
