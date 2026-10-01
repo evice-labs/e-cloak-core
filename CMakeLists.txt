@@ -27,6 +27,7 @@ logos_module(
     EXTERNAL_LIBS
         e_identity_sdk
         e_moderation_sdk
+        e_chat_bridge
     LINK_LIBRARIES
         crypto
         zstd
