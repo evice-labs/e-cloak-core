@@ -1,37 +1,54 @@
 # Evice Cloak Core
 
-**e-cloak-core** is the native C++ Qt Plugin Engine for **Logos Basecamp**, bridging the **e-identity-stack** (`e_identity_sdk` and `e_moderation_sdk`) to the **e-cloak** QML frontend via C-ABI FFI and Basecamp IPC.
+**e-cloak-core** is the native C++ Qt Plugin Engine for **Logos Basecamp**, bridging the **e-identity-stack** (`e_identity_sdk`, `e_moderation_sdk`, and `e_chat_bridge`) and decentralized transport (**logos-delivery**) to the **e-cloak** QML frontend via C-ABI FFI and Basecamp IPC.
 
 ## Architectural Overview
 
-`e-cloak-core` implements the core backend service and exposes cryptographic and storage APIs to Basecamp:
+`e-cloak-core` implements the core backend service and exposes cryptographic, messaging, and storage APIs to Basecamp:
 
 1. **Identity Management**:
    - Random and deterministic Nullifier Secret Key (NSK) derivation.
    - Commitment computation: `SHA256(NSK)`.
    - Off-chain username registry with Schnorr signature authentication.
+   - On-chain staking and LEZ collateral verification (`150 LEZ` minimum balance).
 
 2. **Decentralized Room Management**:
    - Deterministic room creation (`SHA256(admin_commitment || creation_index || n_mod || m_mod)`).
    - Cryptographically signed join-consent requests.
    - Room maturity validation (age indexes and active member tracking).
 
-3. **Two-Tier Shamir Secret Sharing (SSS) Chat Messaging**:
+3. **Decentralized MLS (RFC 9420) Group & 1-on-1 Chat**:
+   - Native integration with `e_chat_bridge` (Messaging Layer Security engine).
+   - Joiner client workflow: RFC 9420 `KeyPackage` generation and sharing.
+   - Epoch commit & `Welcome` message generation and ratchet tree state synchronization.
+   - Forward secrecy and post-compromise security (PCS) across member joins and message epochs.
+   - End-to-end encrypted 1-on-1 private Direct Messages (DMs).
+
+4. **Two-Tier Shamir Secret Sharing (SSS) Chat Messaging**:
    - `MemberClient` integration: creates post payloads with Tier-2 point assignment.
    - Tier-1 N-of-M splitting per post.
    - Diffie-Hellman (ECDH) encryption of secret shares targeted at individual moderator public keys.
+   - Seamless MLS payload binding: combines MLS group ratchet encryption with verifiable Two-Tier SSS shares.
 
-4. **Moderator Strike Protocol**:
+5. **Moderator Strike Protocol**:
    - `ModeratorClient` share decryption using secp256k1 private keys.
    - BIP-340 Schnorr strike certification.
    - Multi-signature certificate validation.
 
-5. **Lagrange Slashing & Identity De-Anonymization**:
+6. **Lagrange Slashing & Identity De-Anonymization**:
    - Tier-1 strike reconstruction from N moderator shares over GF(2⁸).
    - Tier-2 full NSK reconstruction from K accumulated strikes.
-   - Identity commitment blacklisting.
+   - Identity commitment blacklisting and automatic revocation.
 
-6. **Encrypted Blob & Chat Storage**:
+7. **Decentralized Transport (Logos Delivery / Waku)**:
+   - Dynamic linking and runtime loading (`dlopen`) of `liblogosdelivery.so`.
+   - Waku v2 content topic pub/sub routing:
+     - Group messages: `/e-identity/1/room-{roomIdHex}/proto`
+     - Handshake messages: `/e-identity/1/room-{roomIdHex}-handshake/proto`
+     - 1-on-1 DMs: `/e-identity/1/dm-{channelIdHex}/proto`
+   - Resilient transport fallback with in-memory buffering for offline and standalone operations.
+
+8. **Encrypted Blob & Persistent Chat Storage**:
    - High-performance Zstandard compression (`ZSTD_compress`).
    - Authenticated encryption via OpenSSL AES-256-GCM.
    - Key derivation using SHA-256 from user's Nullifier Secret Key (NSK).
@@ -43,25 +60,45 @@
 e-cloak-core/
 ├── LICENSE                 # Business Source License 1.1 (BSL 1.1)
 ├── CMakeLists.txt          # CMake plugin build script (logos_module)
-├── metadata.json           # Basecamp core module manifest (e_cloak_core / e-cloak-core)
+├── metadata.json           # Basecamp core module manifest (e_cloak_core)
 ├── flake.nix               # Nix packaging definition
 ├── README.md               # Architecture and integration documentation
 ├── lib/                    # Vendor FFI binaries & headers from e-identity-stack
 │   ├── e_identity_sdk.h    # Cryptographic identity & vault headers
-│   ├── e_moderation_sdk.h  # GF(2^8) & Shamir Secret Sharing headers
 │   ├── libe_identity_sdk.so
-│   └── libe_moderation_sdk.so
-└── src/
-    ├── e_cloak_core_impl.h    # Core module implementation header
-    └── e_cloak_core_impl.cpp  # Implementation bridging Qt/QML to Rust FFI & encrypted storage
+│   ├── e_moderation_sdk.h  # GF(2^8) & Shamir Secret Sharing headers
+│   ├── libe_moderation_sdk.so
+│   ├── e_chat_bridge.h     # RFC 9420 Messaging Layer Security (MLS) headers
+│   └── libe_chat_bridge.so
+├── src/
+│   ├── e_cloak_core_impl.h    # Core module implementation header
+│   └── e_cloak_core_impl.cpp  # Implementation bridging Qt/QML to Rust FFI & transport
+└── tests/
+    └── test_de_mls_integration.cpp # End-to-end integration test suite
 ```
 
-## Build Instructions
+## Build & Test Instructions
+
+### Building with Nix (Recommended)
 
 Using Nix with Logos Module Builder:
 
 ```bash
-nix build .#
+nix build .# --no-link --print-out-paths
+```
+
+### Running Integration Tests
+
+Compile and execute the end-to-end test runner:
+
+```bash
+/usr/bin/g++ -std=c++20 \
+  tests/test_de_mls_integration.cpp \
+  src/e_cloak_core_impl.cpp \
+  -Isrc -Ilib \
+  -Llib -le_identity_sdk -le_moderation_sdk -le_chat_bridge -lcrypto -lzstd -ldl \
+  -Wl,-rpath,lib \
+  -o tests/test_de_mls_runner && ./tests/test_de_mls_runner
 ```
 
 ## License
