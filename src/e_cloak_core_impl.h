@@ -37,6 +37,8 @@ public:
     std::string prepareRegistration(const std::string& username, uint64_t kSssThreshold, const std::string& nodePubkeysJson);
     std::string registerUsername(const std::string& username);
     std::string lookupUsername(const std::string& commitmentHex);
+    std::string lookupCommitment(const std::string& username);
+    std::string getRegisteredUsersList();
     bool hasActiveIdentity();
     std::string getSchnorrPublicKey();
     std::string getIdentityInfo();
@@ -129,7 +131,12 @@ private:
     std::string m_cachedUsername;
     bool m_staked = false;
     uint64_t m_stakeAmount = 0;
+    bool m_onchainSynced = true;
+    std::string m_onchainTxHash;
     void loadPersistedIdentity();
     void savePersistedIdentity();
+    void dispatchOnChainRegistration(const std::string& commitmentHex, const std::string& username);
+    void syncRegisteredUsersFromFile();
+    void persistRegisteredUser(const std::string& commitmentHex, const std::string& username);
     std::vector<uint8_t> getStorageKey();
 };
