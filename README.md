@@ -9,7 +9,8 @@
 1. **Identity Management**:
    - Random and deterministic Nullifier Secret Key (NSK) derivation.
    - Commitment computation: `SHA256(NSK)`.
-   - Off-chain username registry with Schnorr signature authentication.
+   - Off-chain and on-chain username registry with Schnorr signature authentication.
+   - Strict username validation: 3..32 characters, ASCII alphanumeric + underscore (`_`), with case-insensitive collision rejection.
    - On-chain staking and LEZ collateral verification (`150 LEZ` minimum balance).
 
 2. **Decentralized Room Management**:
@@ -54,6 +55,11 @@
    - Key derivation using SHA-256 from user's Nullifier Secret Key (NSK).
    - Storage path under `module_data/e-cloak-core` with automatic backward-compatibility migration from `module_data/ecloakcore`.
 
+9. **Global User Discovery & Headless Dispatcher Integration**:
+   - **Hybrid Registry Persistence**: Active identities and discovered contacts stored in `module_data/e-cloak-core/registered_users.json`.
+   - **Decentralized P2P Peer Announcements**: Newly registered users are automatically published over Logos Delivery (Waku) topic `/e-identity/1/global-registry/proto`, enabling instant, zero-config user discovery across distinct app instances.
+   - **Headless On-Chain Dispatcher**: Background execution of `e_cloak_dispatcher register-username` directly submitting transactions to LEZ Testnet with real-time inclusion polling.
+
 ## Directory Structure
 
 ```
@@ -74,7 +80,8 @@ e-cloak-core/
 │   ├── e_cloak_core_impl.h    # Core module implementation header
 │   └── e_cloak_core_impl.cpp  # Implementation bridging Qt/QML to Rust FFI & transport
 └── tests/
-    └── test_de_mls_integration.cpp # End-to-end integration test suite
+    ├── test_de_mls_integration.cpp # End-to-end de-MLS & Logos Delivery integration test suite
+    └── test_user_discovery.cpp     # User discovery, validation & registry integration test suite
 ```
 
 ## Build & Test Instructions
@@ -89,7 +96,21 @@ nix build .# --no-link --print-out-paths
 
 ### Running Integration Tests
 
-Compile and execute the end-to-end test runner:
+#### 1. User Discovery, Validation & Global Registry Suite
+Compile and execute the user discovery integration test:
+
+```bash
+/usr/bin/g++ -std=c++20 \
+  tests/test_user_discovery.cpp \
+  src/e_cloak_core_impl.cpp \
+  -Isrc -Ilib \
+  -Llib -le_identity_sdk -le_moderation_sdk -le_chat_bridge -lcrypto -lzstd -ldl \
+  -Wl,-rpath,lib \
+  -o tests/test_user_discovery_runner && ./tests/test_user_discovery_runner
+```
+
+#### 2. Decentralized MLS & Logos Delivery Suite
+Compile and execute the end-to-end de-MLS test runner:
 
 ```bash
 /usr/bin/g++ -std=c++20 \
