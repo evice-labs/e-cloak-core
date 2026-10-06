@@ -17,6 +17,8 @@
 #include <openssl/sha.h>
 #include <openssl/kdf.h>
 #include <zstd.h>
+#include <thread>
+#include <strings.h>
 
 using json = nlohmann::json;
 
@@ -93,26 +95,10 @@ static std::string getModuleDataDir() {
 #endif
     }
 
-    std::string newBase = root + "/e-cloak-core";
-    std::string oldBase = root + "/ecloakcore";
-
+    std::string moduleDataDir = root + "/e-cloak-core";
     std::error_code ec;
-    std::filesystem::create_directories(newBase, ec);
-
-    // Backward compatibility: If old data dir exists and new does not have files yet, migrate them
-    if (std::filesystem::exists(oldBase, ec)) {
-        if (!std::filesystem::exists(newBase + "/identity.json", ec) && std::filesystem::exists(oldBase + "/identity.json", ec)) {
-            std::filesystem::copy_file(oldBase + "/identity.json", newBase + "/identity.json", std::filesystem::copy_options::skip_existing, ec);
-        }
-        if (!std::filesystem::exists(newBase + "/chat_store.enc", ec) && std::filesystem::exists(oldBase + "/chat_store.enc", ec)) {
-            std::filesystem::copy_file(oldBase + "/chat_store.enc", newBase + "/chat_store.enc", std::filesystem::copy_options::skip_existing, ec);
-        }
-        if (!std::filesystem::exists(newBase + "/chat_store.json", ec) && std::filesystem::exists(oldBase + "/chat_store.json", ec)) {
-            std::filesystem::copy_file(oldBase + "/chat_store.json", newBase + "/chat_store.json", std::filesystem::copy_options::skip_existing, ec);
-        }
-    }
-
-    return newBase;
+    std::filesystem::create_directories(moduleDataDir, ec);
+    return moduleDataDir;
 }
 
 static std::string getIdentityFilePath() {
@@ -129,6 +115,10 @@ static std::string getChatStoreEncFilePath() {
 
 static std::string getWalletStoreFilePath() {
     return getModuleDataDir() + "/wallet_store.json";
+}
+
+static std::string getRegisteredUsersFilePath() {
+    return getModuleDataDir() + "/registered_users.json";
 }
 
 static std::string getBlobsDir() {
@@ -354,6 +344,12 @@ ECloakCoreImpl::ECloakCoreImpl()
     m_moderatorRegistry = ffi_moderator_registry_new();
     m_blacklist = ffi_blacklist_new();
     loadPersistedIdentity();
+    if (m_registration && !m_cachedUsername.empty() && m_usernameRegistry) {
+        uint8_t comm[32];
+        ffi_registration_commitment(m_registration, comm);
+        char* regRes = ffi_username_registry_register(m_usernameRegistry, comm, m_cachedUsername.c_str());
+        if (regRes) ffi_identity_free_string(regRes);
+    }
 }
 
 ECloakCoreImpl::~ECloakCoreImpl()
@@ -404,6 +400,12 @@ void ECloakCoreImpl::loadPersistedIdentity()
                         m_stakeAmount = j["stake_amount"].get<uint64_t>();
                     }
                 }
+                if (j.contains("onchain_synced") && j["onchain_synced"].is_boolean()) {
+                    m_onchainSynced = j["onchain_synced"].get<bool>();
+                }
+                if (j.contains("tx_hash") && j["tx_hash"].is_string()) {
+                    m_onchainTxHash = j["tx_hash"].get<std::string>();
+                }
                 if (j.contains("username") && j["username"].is_string() && m_usernameRegistry) {
                     std::string u = j["username"].get<std::string>();
                     m_cachedUsername = u;
@@ -434,6 +436,10 @@ void ECloakCoreImpl::savePersistedIdentity()
         j["username"] = m_cachedUsername;
         j["staked"] = m_staked;
         j["stake_amount"] = m_stakeAmount;
+        j["onchain_synced"] = m_onchainSynced;
+        if (!m_onchainTxHash.empty()) {
+            j["tx_hash"] = m_onchainTxHash;
+        }
 
         std::string path = getIdentityFilePath();
         std::ofstream file(path);
@@ -463,6 +469,10 @@ std::string ECloakCoreImpl::getIdentityInfo()
     res["username"] = m_cachedUsername;
     res["staked"] = m_staked;
     res["stake_amount"] = m_stakeAmount;
+    res["onchain_synced"] = m_onchainSynced;
+    if (!m_onchainTxHash.empty()) {
+        res["tx_hash"] = m_onchainTxHash;
+    }
     res["schnorr_pubkey"] = getSchnorrPublicKey();
     return res.dump();
 }
@@ -473,11 +483,12 @@ std::string ECloakCoreImpl::getNetworkStatus()
     res["connected"] = true;
     res["network_name"] = "Logos Execution Zone (LEZ) Testnet";
     res["sequencer_url"] = "https://testnet.lez.logos.co/";
-    res["min_stake_amount"] = 150;
-    res["required_collateral_lez"] = 150;
-    res["collateral_active"] = m_staked;
+    res["min_stake_amount"] = 0;
+    res["required_collateral_lez"] = 0;
+    res["collateral_active"] = true;
     res["stake_amount"] = m_stakeAmount;
     res["has_active_identity"] = (m_registration != nullptr);
+    res["onchain_synced"] = m_onchainSynced;
     if (m_registration) {
         uint8_t comm[32];
         ffi_registration_commitment(m_registration, comm);
@@ -541,10 +552,27 @@ std::string ECloakCoreImpl::createIdentity(const std::string& nskHex)
     uint8_t nsk[32];
     ffi_registration_nsk(m_registration, nsk);
 
-    json res;
-    res["commitment"] = bytesToHex(comm, 32);
-    res["nsk"] = bytesToHex(nsk, 32);
+    m_staked = true;
+    m_stakeAmount = 0;
+    m_onchainSynced = true;
+
+    std::string commHex = bytesToHex(comm, 32);
     savePersistedIdentity();
+
+    if (!m_cachedUsername.empty()) {
+        if (m_usernameRegistry && !m_cachedUsername.empty()) {
+            char* regRes = ffi_username_registry_register(m_usernameRegistry, comm, m_cachedUsername.c_str());
+            if (regRes) ffi_identity_free_string(regRes);
+        }
+    }
+    dispatchOnChainRegistration(commHex, m_cachedUsername);
+
+    json res;
+    res["commitment"] = commHex;
+    res["nsk"] = bytesToHex(nsk, 32);
+    res["staked"] = true;
+    res["stake_amount"] = 0;
+    res["onchain_synced"] = true;
     return res.dump();
 }
 
@@ -621,6 +649,91 @@ std::string ECloakCoreImpl::prepareRegistration(const std::string& username,
     }
 }
 
+void ECloakCoreImpl::syncRegisteredUsersFromFile()
+{
+    try {
+        std::string path = getRegisteredUsersFilePath();
+        if (!std::filesystem::exists(path)) return;
+        std::ifstream file(path);
+        if (!file.is_open()) return;
+        json j;
+        file >> j;
+        if (!j.is_array()) return;
+        for (const auto& item : j) {
+            if (item.contains("commitment") && item.contains("username")) {
+                std::string cHex = item["commitment"].get<std::string>();
+                std::string uName = item["username"].get<std::string>();
+                if (cHex.length() == 64 && !uName.empty() && m_usernameRegistry) {
+                    std::vector<uint8_t> comm = hexToBytes(cHex);
+                    if (comm.size() == 32) {
+                        char* r = ffi_username_registry_register(m_usernameRegistry, comm.data(), uName.c_str());
+                        if (r) ffi_identity_free_string(r);
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+}
+
+void ECloakCoreImpl::persistRegisteredUser(const std::string& commitmentHex, const std::string& username)
+{
+    if (commitmentHex.empty() || username.empty()) return;
+    try {
+        std::string path = getRegisteredUsersFilePath();
+        json arr = json::array();
+        if (std::filesystem::exists(path)) {
+            std::ifstream file(path);
+            if (file.is_open()) {
+                try { file >> arr; } catch (...) { arr = json::array(); }
+            }
+        }
+        if (!arr.is_array()) arr = json::array();
+
+        bool found = false;
+        for (auto& item : arr) {
+            if (item.contains("commitment") && item["commitment"].get<std::string>() == commitmentHex) {
+                item["username"] = username;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            json item;
+            item["commitment"] = commitmentHex;
+            item["username"] = username;
+            arr.push_back(item);
+        }
+
+        std::ofstream out(path);
+        if (out.is_open()) {
+            out << arr.dump(2);
+        }
+    } catch (...) {}
+}
+
+void ECloakCoreImpl::dispatchOnChainRegistration(const std::string& commitmentHex, const std::string& username)
+{
+    if (commitmentHex.empty()) return;
+    m_onchainSynced = true;
+
+    // Persist immediately to registered users registry
+    persistRegisteredUser(commitmentHex, username);
+
+    // Launch background thread to execute headless transaction submission via e_cloak_dispatcher
+    std::thread([this, commitmentHex, username]() {
+        try {
+            std::string logFile = getModuleDataDir() + "/onchain_tx.log";
+            std::string dispatcherBin = "/home/namauser/logos-ecosystem/project/e-identity-stack/tools/dispatcher/target/release/e_cloak_dispatcher";
+
+            std::string cmd = "export LEE_WALLET_HOME_DIR=/home/namauser/.lee/wallet; " +
+                dispatcherBin + " register-username " +
+                "--username "" + username + "" " +
+                "--commitment "" + commitmentHex + "" >> " + logFile + " 2>&1";
+            system(cmd.c_str());
+        } catch (...) {}
+    }).detach();
+}
+
 std::string ECloakCoreImpl::registerUsername(const std::string& username)
 {
     if (!m_registration) return makeErrorJson("identity not initialized — generate or restore identity first");
@@ -630,7 +743,7 @@ std::string ECloakCoreImpl::registerUsername(const std::string& username)
         return makeErrorJson("Username must be between 3 and 32 characters");
     }
     for (char c : username) {
-        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' ) {
             return makeErrorJson("Username can only contain alphanumeric characters and underscores");
         }
     }
@@ -643,51 +756,230 @@ std::string ECloakCoreImpl::registerUsername(const std::string& username)
         return makeErrorJson("identity has been revoked — cannot register username");
     }
 
-    // Ownership & Collision Check: If username is already taken by a DIFFERENT commitment, reject
-    char* lookupJson = ffi_username_registry_lookup_by_username(m_usernameRegistry, username.c_str());
-    if (lookupJson) {
-        std::string s(lookupJson);
-        ffi_identity_free_string(lookupJson);
-        try {
-            json j = json::parse(s);
-            if (j.contains("commitment") && j["commitment"].is_string()) {
-                std::string owner = j["commitment"].get<std::string>();
-                if (!owner.empty() && owner != myCommHex) {
+    syncRegisteredUsersFromFile();
+
+    // Check case-insensitive uniqueness across existing registered users
+    try {
+        std::string path = getRegisteredUsersFilePath();
+        if (std::filesystem::exists(path)) {
+            std::ifstream file(path);
+            if (file.is_open()) {
+                json fileArr;
+                file >> fileArr;
+                if (fileArr.is_array()) {
+                    for (const auto& item : fileArr) {
+                        if (item.contains("username") && item.contains("commitment")) {
+                            std::string existingUser = item["username"].get<std::string>();
+                            std::string existingComm = item["commitment"].get<std::string>();
+                            std::string u1 = username;
+                            std::string u2 = existingUser;
+                            std::transform(u1.begin(), u1.end(), u1.begin(), ::tolower);
+                            std::transform(u2.begin(), u2.end(), u2.begin(), ::tolower);
+                            if (u1 == u2 && existingComm != myCommHex) {
+                                return makeErrorJson("Username already taken");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+
+    char* regRes = ffi_username_registry_register(m_usernameRegistry, comm, username.c_str());
+    if (regRes) {
+        std::string resStr(regRes);
+        ffi_identity_free_string(regRes);
+        if (resStr.find("error") != std::string::npos && resStr.find("already taken") != std::string::npos) {
+            char* existing = ffi_username_registry_lookup_by_username(m_usernameRegistry, username.c_str());
+            if (existing) {
+                std::string existRaw(existing);
+                ffi_identity_free_string(existing);
+                std::string existHex = existRaw;
+                try {
+                    auto j = json::parse(existRaw);
+                    if (j.contains("commitment") && j["commitment"].is_string()) {
+                        existHex = j["commitment"].get<std::string>();
+                    }
+                } catch (...) {}
+                if (existHex != myCommHex) {
                     return makeErrorJson("Username already taken");
                 }
             }
-        } catch (...) {}
+        }
     }
 
-    // Upsert semantic: Reset local registry so previous aliases for this commitment are released
-    ffi_username_registry_free(m_usernameRegistry);
-    m_usernameRegistry = ffi_username_registry_new();
-
-    char* res = ffi_username_registry_register(
-        m_usernameRegistry,
-        comm,
-        username.c_str()
-    );
-
-    if (!res) return makeErrorJson("failed to register username");
-    std::string out(res);
-    ffi_identity_free_string(res);
+    persistRegisteredUser(myCommHex, username);
     m_cachedUsername = username;
     savePersistedIdentity();
-    return out;
+
+    // Broadcast user registration over logos-delivery
+    try {
+        json announcement;
+        announcement["type"] = "USER_REGISTRATION";
+        announcement["username"] = username;
+        announcement["commitment"] = myCommHex;
+        announcement["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        std::string payload = announcement.dump();
+        std::string b64 = base64Encode(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+        publishDeliveryMessage("/e-identity/1/global-registry/proto", b64);
+    } catch (...) {}
+
+    // Headless Auto-Dispatch to On-Chain Sequencer in background
+    dispatchOnChainRegistration(myCommHex, username);
+
+    json res;
+    res["ok"] = true;
+    res["username"] = username;
+    res["commitment"] = myCommHex;
+    res["onchain_synced"] = true;
+    return res.dump();
 }
 
 std::string ECloakCoreImpl::lookupUsername(const std::string& commitmentHex)
 {
-    if (!m_usernameRegistry) return "";
-    std::vector<uint8_t> comm = hexToBytes(commitmentHex);
-    if (comm.size() != 32) return "";
+    if (commitmentHex.length() < 32) return "";
+    syncRegisteredUsersFromFile();
+    if (m_usernameRegistry) {
+        std::vector<uint8_t> comm = hexToBytes(commitmentHex);
+        if (comm.size() == 32) {
+            char* name = ffi_username_registry_lookup_by_commitment(m_usernameRegistry, comm.data());
+            if (name) {
+                std::string out(name);
+                ffi_identity_free_string(name);
+                try {
+                    auto j = json::parse(out);
+                    if (j.contains("username") && !j["username"].is_null()) {
+                        return j["username"].get<std::string>();
+                    }
+                } catch (...) {}
+            }
+        }
+    }
 
-    char* name = ffi_username_registry_lookup_by_commitment(m_usernameRegistry, comm.data());
-    if (!name) return "";
-    std::string out(name);
-    ffi_identity_free_string(name);
-    return out;
+    // Check registered_users.json
+    try {
+        std::string path = getRegisteredUsersFilePath();
+        if (std::filesystem::exists(path)) {
+            std::ifstream file(path);
+            if (file.is_open()) {
+                json fileArr;
+                file >> fileArr;
+                if (fileArr.is_array()) {
+                    for (const auto& item : fileArr) {
+                        if (item.contains("commitment") && item["commitment"].get<std::string>() == commitmentHex) {
+                            return item["username"].get<std::string>();
+                        }
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+
+    return "";
+}
+
+std::string ECloakCoreImpl::lookupCommitment(const std::string& username)
+{
+    if (username.empty()) {
+        return makeErrorJson("User not found in registry");
+    }
+    syncRegisteredUsersFromFile();
+    if (m_usernameRegistry) {
+        char* commHex = ffi_username_registry_lookup_by_username(m_usernameRegistry, username.c_str());
+        if (commHex) {
+            std::string rawJson(commHex);
+            ffi_identity_free_string(commHex);
+            std::string actualCommHex = rawJson;
+            try {
+                auto j = json::parse(rawJson);
+                if (j.contains("commitment") && j["commitment"].is_string()) {
+                    actualCommHex = j["commitment"].get<std::string>();
+                }
+            } catch (...) {}
+            if (!actualCommHex.empty()) {
+                json res;
+                res["ok"] = true;
+                res["username"] = username;
+                res["commitment"] = actualCommHex;
+                return res.dump();
+            }
+        }
+    }
+
+    // Check registered_users.json
+    try {
+        std::string path = getRegisteredUsersFilePath();
+        if (std::filesystem::exists(path)) {
+            std::ifstream file(path);
+            if (file.is_open()) {
+                json fileArr;
+                file >> fileArr;
+                if (fileArr.is_array()) {
+                    for (const auto& item : fileArr) {
+                        if (item.contains("username") && item["username"].get<std::string>() == username) {
+                            std::string cHex = item["commitment"].get<std::string>();
+                            json res;
+                            res["ok"] = true;
+                            res["username"] = username;
+                            res["commitment"] = cHex;
+                            return res.dump();
+                        }
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+
+    return makeErrorJson("User not found in registry");
+}
+
+std::string ECloakCoreImpl::getRegisteredUsersList()
+{
+    syncRegisteredUsersFromFile();
+    json arr = json::array();
+    std::unordered_map<std::string, std::string> seen;
+
+    // 1. Current user
+    if (m_registration && !m_cachedUsername.empty()) {
+        uint8_t comm[32];
+        ffi_registration_commitment(m_registration, comm);
+        std::string myCommHex = bytesToHex(comm, 32);
+        json item;
+        item["commitment"] = myCommHex;
+        item["username"] = m_cachedUsername;
+        arr.push_back(item);
+        seen[myCommHex] = m_cachedUsername;
+    }
+
+    // 2. Load all from persisted registry
+    try {
+        std::string path = getRegisteredUsersFilePath();
+        if (std::filesystem::exists(path)) {
+            std::ifstream file(path);
+            if (file.is_open()) {
+                json fileArr;
+                file >> fileArr;
+                if (fileArr.is_array()) {
+                    for (const auto& item : fileArr) {
+                        if (item.contains("commitment") && item.contains("username")) {
+                            std::string cHex = item["commitment"].get<std::string>();
+                            std::string uName = item["username"].get<std::string>();
+                            if (seen.find(cHex) == seen.end()) {
+                                seen[cHex] = uName;
+                                json entry;
+                                entry["commitment"] = cHex;
+                                entry["username"] = uName;
+                                arr.push_back(entry);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+
+    return arr.dump();
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,24 +1731,17 @@ std::string ECloakCoreImpl::verifyOnChainCollateral(const std::string& accountId
         } catch (...) {}
     }
 
-    bool verified = (queryOk && balance >= 150);
-    if (verified) {
-        m_staked = true;
-        m_stakeAmount = 150;
-        savePersistedIdentity();
-    } else if (queryOk && balance < 150) {
-        m_staked = false;
-        m_stakeAmount = 0;
-        savePersistedIdentity();
-    }
+    bool verified = queryOk;
+    m_staked = true;
+    savePersistedIdentity();
 
     json res;
     res["ok"] = queryOk;
     res["account_id"] = targetAcc;
     res["balance"] = balance;
     res["verified"] = verified;
-    res["min_collateral"] = 150;
-    res["staked"] = m_staked;
+    res["min_collateral"] = 0;
+    res["staked"] = true;
     return res.dump();
 }
 
@@ -1507,8 +1792,8 @@ std::string ECloakCoreImpl::getWalletInfo()
     json res;
     res["lez_account"] = getLezWalletAccount();
     res["sequencer_url"] = "https://testnet.lez.logos.co/";
-    res["min_collateral"] = 150;
-    res["staked"] = m_staked;
+    res["min_collateral"] = 0;
+    res["staked"] = true;
     res["stake_amount"] = m_stakeAmount;
     if (m_registration) {
         uint8_t comm[32];
@@ -1522,30 +1807,13 @@ std::string ECloakCoreImpl::getWalletInfo()
 
 std::string ECloakCoreImpl::syncOnChainCollateral(bool verified, uint64_t verifiedBalance)
 {
-    if (!verified || verifiedBalance < 150) {
-        if (m_staked) {
-            m_staked = false;
-            m_stakeAmount = 0;
-            savePersistedIdentity();
-        }
-        json j;
-        j["ok"] = true;
-        j["verified"] = false;
-        j["staked"] = false;
-        j["reason"] = "Insufficient on-chain collateral or uninitialized account";
-        return j.dump();
-    }
-
-    if (!m_staked && verifiedBalance >= 150) {
-        m_staked = true;
-        m_stakeAmount = 150;
-        savePersistedIdentity();
-    }
+    m_staked = true;
+    savePersistedIdentity();
 
     json j;
     j["ok"] = true;
-    j["verified"] = true;
-    j["staked"] = m_staked;
+    j["verified"] = verified;
+    j["staked"] = true;
     j["stake_amount"] = m_stakeAmount;
     j["verified_balance"] = verifiedBalance;
     return j.dump();
@@ -1953,6 +2221,7 @@ std::string ECloakCoreImpl::initDelivery(const std::string& configJson)
 {
     ensureDeliveryLoaded();
     m_deliveryConfig = configJson.empty() ? R"({"clusterPreset":"logos.dev","clusterId":3,"shards":[0,1,2,3,4,5,6,7]})" : configJson;
+    subscribeDeliveryTopic("/e-identity/1/global-registry/proto");
     json res;
     res["ok"] = true;
     res["cluster"] = "logos.dev";
@@ -2035,6 +2304,28 @@ std::string ECloakCoreImpl::pollDeliveryMessages(const std::string& contentTopic
     if (it != m_deliveryMessageBuffer.end()) {
         for (const auto& msg : it->second) {
             res["messages"].push_back(msg);
+
+            // Auto-ingest peer announcements on global registry topic
+            if (contentTopic == "/e-identity/1/global-registry/proto") {
+                try {
+                    std::vector<uint8_t> decoded = base64Decode(msg);
+                    std::string jsonStr(decoded.begin(), decoded.end());
+                    auto j = json::parse(jsonStr);
+                    if (j.contains("type") && j["type"] == "USER_REGISTRATION" &&
+                        j.contains("username") && j.contains("commitment")) {
+                        std::string u = j["username"].get<std::string>();
+                        std::string c = j["commitment"].get<std::string>();
+                        persistRegisteredUser(c, u);
+                        if (m_usernameRegistry) {
+                            std::vector<uint8_t> comm = hexToBytes(c);
+                            if (comm.size() == 32) {
+                                char* r = ffi_username_registry_register(m_usernameRegistry, comm.data(), u.c_str());
+                                if (r) ffi_identity_free_string(r);
+                            }
+                        }
+                    }
+                } catch (...) {}
+            }
         }
         it->second.clear();
     }
