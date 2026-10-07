@@ -11,7 +11,7 @@
    - Commitment computation: `SHA256(NSK)`.
    - Off-chain and on-chain username registry with Schnorr signature authentication.
    - Strict username validation: 3..32 characters, ASCII alphanumeric + underscore (`_`), with case-insensitive collision rejection.
-   - On-chain staking and LEZ collateral verification (`150 LEZ` minimum balance).
+   - Zero-cost on-chain registration (fees covered by eCloak sponsor account `Public/9p7BZn9g6UrVMBiatyeNtq4yv9DitxYM1ZXsjYi6vf47`). Sybil and spam deterrence are enforced cryptographically via Two-Tier SSS de-anonymization and on-chain commitment revocation without requiring user collateral.
 
 2. **Decentralized Room Management**:
    - Deterministic room creation (`SHA256(admin_commitment || creation_index || n_mod || m_mod)`).
