@@ -18,6 +18,7 @@
 #include <openssl/kdf.h>
 #include <zstd.h>
 #include <thread>
+#include <chrono>
 #include <strings.h>
 
 using json = nlohmann::json;
@@ -119,6 +120,10 @@ static std::string getWalletStoreFilePath() {
 
 static std::string getRegisteredUsersFilePath() {
     return getModuleDataDir() + "/registered_users.json";
+}
+
+static std::string getProfilesFilePath() {
+    return getModuleDataDir() + "/profiles.json";
 }
 
 static std::string getBlobsDir() {
@@ -350,6 +355,11 @@ ECloakCoreImpl::ECloakCoreImpl()
         char* regRes = ffi_username_registry_register(m_usernameRegistry, comm, m_cachedUsername.c_str());
         if (regRes) ffi_identity_free_string(regRes);
     }
+
+    // Auto-sync state from on-chain LEZ smart contract in background
+    std::thread([this]() {
+        syncFromOnChainState();
+    }).detach();
 }
 
 ECloakCoreImpl::~ECloakCoreImpl()
@@ -514,6 +524,21 @@ std::string ECloakCoreImpl::recordStake(uint64_t amount)
 
 std::string ECloakCoreImpl::createIdentity(const std::string& nskHex)
 {
+    // Maximum 2 accounts per computer validation
+    syncProfilesStorage();
+    try {
+        std::string pPath = getProfilesFilePath();
+        if (std::filesystem::exists(pPath)) {
+            std::ifstream f(pPath);
+            if (f.is_open()) {
+                json pj; f >> pj;
+                if (pj.contains("profiles") && pj["profiles"].is_array() && pj["profiles"].size() >= 2) {
+                    return makeErrorJson("Maximum 2 accounts per computer reached. Cannot add more identities.");
+                }
+            }
+        }
+    } catch (...) {}
+
     // Anti-Bypass Guard: Prevent regeneration if an active unrevoked identity already exists
     if (m_registration != nullptr) {
         uint8_t existingComm[32];
@@ -727,8 +752,8 @@ void ECloakCoreImpl::dispatchOnChainRegistration(const std::string& commitmentHe
 
             std::string cmd = "export LEE_WALLET_HOME_DIR=/home/namauser/.lee/wallet; " +
                 dispatcherBin + " register-username " +
-                "--username "" + username + "" " +
-                "--commitment "" + commitmentHex + "" >> " + logFile + " 2>&1";
+                "--username \"" + username + "\" " +
+                "--commitment \"" + commitmentHex + "\" >> " + logFile + " 2>&1";
             system(cmd.c_str());
         } catch (...) {}
     }).detach();
@@ -1546,7 +1571,7 @@ std::string ECloakCoreImpl::saveChatStore(const std::string& chatStoreJson)
         std::vector<uint8_t> encrypted = encryptAes256Gcm(key, compressed);
 
         // 4. Atomic file write
-        std::string encPath = getChatStoreEncFilePath();
+        std::string encPath = getScopedChatStoreEncFilePath();
         std::string tmpPath = encPath + ".tmp";
         {
             std::ofstream file(tmpPath, std::ios::binary);
@@ -1582,7 +1607,7 @@ std::string ECloakCoreImpl::saveChatStore(const std::string& chatStoreJson)
 std::string ECloakCoreImpl::loadChatStore()
 {
     try {
-        std::string encPath = getChatStoreEncFilePath();
+        std::string encPath = getScopedChatStoreEncFilePath();
         if (std::filesystem::exists(encPath)) {
             std::ifstream file(encPath, std::ios::binary | std::ios::ate);
             if (file.is_open()) {
@@ -1620,7 +1645,7 @@ std::string ECloakCoreImpl::clearChatStore()
 {
     try {
         std::error_code ec;
-        std::string encPath = getChatStoreEncFilePath();
+        std::string encPath = getScopedChatStoreEncFilePath();
         if (std::filesystem::exists(encPath)) {
             std::filesystem::remove(encPath, ec);
         }
@@ -1749,7 +1774,7 @@ std::string ECloakCoreImpl::saveWalletStore(const std::string& walletStoreJson)
 {
     try {
         auto parsed = json::parse(walletStoreJson);
-        std::string path = getWalletStoreFilePath();
+        std::string path = getScopedWalletStoreFilePath();
         std::ofstream file(path);
         if (!file.is_open()) {
             return makeErrorJson("Failed to open wallet store file for writing");
@@ -1766,7 +1791,7 @@ std::string ECloakCoreImpl::saveWalletStore(const std::string& walletStoreJson)
 std::string ECloakCoreImpl::loadWalletStore()
 {
     try {
-        std::string path = getWalletStoreFilePath();
+        std::string path = getScopedWalletStoreFilePath();
         if (std::filesystem::exists(path)) {
             std::ifstream file(path);
             if (file.is_open()) {
@@ -2264,70 +2289,229 @@ std::string ECloakCoreImpl::getDeliveryStatus()
     return res.dump();
 }
 
-std::string ECloakCoreImpl::subscribeDeliveryTopic(const std::string& contentTopic)
-{
-    if (contentTopic.empty()) {
-        return makeErrorJson("contentTopic cannot be empty");
-    }
-    if (m_deliveryMessageBuffer.find(contentTopic) == m_deliveryMessageBuffer.end()) {
-        m_deliveryMessageBuffer[contentTopic] = std::vector<std::string>();
-    }
-    json res;
-    res["ok"] = true;
-    res["subscribed"] = contentTopic;
-    return res.dump();
+
+
+std::string ECloakCoreImpl::getActiveCommitmentHex() {
+    if (!m_registration) return "";
+    uint8_t comm[32];
+    ffi_registration_commitment(m_registration, comm);
+    return bytesToHex(comm, 32);
 }
 
-std::string ECloakCoreImpl::publishDeliveryMessage(const std::string& contentTopic, const std::string& base64Payload)
-{
-    if (contentTopic.empty()) {
-        return makeErrorJson("contentTopic cannot be empty");
+std::string ECloakCoreImpl::getScopedChatStoreEncFilePath() {
+    std::string commHex = getActiveCommitmentHex();
+    if (!commHex.empty()) {
+        return getModuleDataDir() + "/chat_store_" + commHex.substr(0, 16) + ".enc";
     }
-    m_deliveryMessageBuffer[contentTopic].push_back(base64Payload);
-
-    json res;
-    res["ok"] = true;
-    res["contentTopic"] = contentTopic;
-    res["payload_length"] = base64Payload.size();
-    res["published"] = true;
-    return res.dump();
+    return getModuleDataDir() + "/chat_store.enc";
 }
 
-std::string ECloakCoreImpl::pollDeliveryMessages(const std::string& contentTopic)
-{
-    json res;
-    res["ok"] = true;
-    res["contentTopic"] = contentTopic;
-    res["messages"] = json::array();
+std::string ECloakCoreImpl::getScopedWalletStoreFilePath() {
+    std::string commHex = getActiveCommitmentHex();
+    if (!commHex.empty()) {
+        return getModuleDataDir() + "/wallet_store_" + commHex.substr(0, 16) + ".json";
+    }
+    return getModuleDataDir() + "/wallet_store.json";
+}
 
-    auto it = m_deliveryMessageBuffer.find(contentTopic);
-    if (it != m_deliveryMessageBuffer.end()) {
-        for (const auto& msg : it->second) {
-            res["messages"].push_back(msg);
+void ECloakCoreImpl::syncProfilesStorage() {
+    try {
+        std::string pPath = getProfilesFilePath();
+        json rootJson;
+        bool exists = std::filesystem::exists(pPath);
+        if (exists) {
+            std::ifstream f(pPath);
+            if (f.is_open()) {
+                try { f >> rootJson; } catch (...) { rootJson = json::object(); }
+            }
+        }
+        if (!rootJson.is_object()) rootJson = json::object();
+        if (!rootJson.contains("profiles") || !rootJson["profiles"].is_array()) {
+            rootJson["profiles"] = json::array();
+        }
 
-            // Auto-ingest peer announcements on global registry topic
-            if (contentTopic == "/e-identity/1/global-registry/proto") {
-                try {
-                    std::vector<uint8_t> decoded = base64Decode(msg);
-                    std::string jsonStr(decoded.begin(), decoded.end());
-                    auto j = json::parse(jsonStr);
-                    if (j.contains("type") && j["type"] == "USER_REGISTRATION" &&
-                        j.contains("username") && j.contains("commitment")) {
-                        std::string u = j["username"].get<std::string>();
-                        std::string c = j["commitment"].get<std::string>();
-                        persistRegisteredUser(c, u);
-                        if (m_usernameRegistry) {
-                            std::vector<uint8_t> comm = hexToBytes(c);
-                            if (comm.size() == 32) {
-                                char* r = ffi_username_registry_register(m_usernameRegistry, comm.data(), u.c_str());
-                                if (r) ffi_identity_free_string(r);
+        auto& pArr = rootJson["profiles"];
+
+        // Seed from known identities if empty
+        if (pArr.empty()) {
+            std::string idPath = getIdentityFilePath();
+            if (std::filesystem::exists(idPath)) {
+                std::ifstream f(idPath);
+                if (f.is_open()) {
+                    json idJ; f >> idJ;
+                    if (idJ.contains("commitment") && idJ.contains("nsk")) {
+                        pArr.push_back(idJ);
+                    }
+                }
+            }
+            for (const std::string& fallback : { "/home/namauser/logos-ecosystem/identity.json", "/home/namauser/logos-ecosystem/identity_backup.json" }) {
+                if (pArr.size() >= 2) break;
+                if (std::filesystem::exists(fallback)) {
+                    std::ifstream f(fallback);
+                    if (f.is_open()) {
+                        json fbJ; f >> fbJ;
+                        if (fbJ.contains("commitment") && fbJ.contains("nsk")) {
+                            std::string fbComm = fbJ["commitment"].get<std::string>();
+                            bool alreadyIn = false;
+                            for (const auto& existing : pArr) {
+                                if (existing.contains("commitment") && existing["commitment"].get<std::string>() == fbComm) {
+                                    alreadyIn = true;
+                                    break;
+                                }
+                            }
+                            if (!alreadyIn) {
+                                pArr.push_back(fbJ);
                             }
                         }
                     }
-                } catch (...) {}
+                }
             }
         }
-        it->second.clear();
+
+        // Update active profile in array
+        std::string activeComm = getActiveCommitmentHex();
+        if (!activeComm.empty()) {
+            bool found = false;
+            for (auto& p : pArr) {
+                if (p.contains("commitment") && p["commitment"].get<std::string>() == activeComm) {
+                    p["username"] = m_cachedUsername;
+                    p["staked"] = m_staked;
+                    p["stake_amount"] = m_stakeAmount;
+                    p["onchain_synced"] = m_onchainSynced;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && pArr.size() < 2) {
+                uint8_t nsk[32];
+                ffi_registration_nsk(m_registration, nsk);
+                json newP;
+                newP["commitment"] = activeComm;
+                newP["nsk"] = bytesToHex(nsk, 32);
+                newP["username"] = m_cachedUsername;
+                newP["staked"] = m_staked;
+                newP["stake_amount"] = m_stakeAmount;
+                newP["onchain_synced"] = m_onchainSynced;
+                pArr.push_back(newP);
+            }
+            rootJson["active_commitment"] = activeComm;
+        } else if (!pArr.empty()) {
+            rootJson["active_commitment"] = pArr[0]["commitment"].get<std::string>();
+        }
+
+        std::ofstream out(pPath);
+        if (out.is_open()) {
+            out << rootJson.dump(2);
+        }
+    } catch (...) {}
+}
+
+std::string ECloakCoreImpl::getProfilesList()
+{
+    syncProfilesStorage();
+    try {
+        std::string pPath = getProfilesFilePath();
+        if (!std::filesystem::exists(pPath)) {
+            return "[]";
+        }
+        std::ifstream f(pPath);
+        if (!f.is_open()) return "[]";
+        json rootJ;
+        f >> rootJ;
+        if (!rootJ.contains("profiles") || !rootJ["profiles"].is_array()) {
+            return "[]";
+        }
+        std::string activeComm = getActiveCommitmentHex();
+        json res = json::array();
+        for (const auto& p : rootJ["profiles"]) {
+            json item;
+            std::string c = p.value("commitment", "");
+            item["commitment"] = c;
+            item["username"] = p.value("username", "Anonymous");
+            item["is_active"] = (c == activeComm);
+            item["staked"] = p.value("staked", false);
+            item["stake_amount"] = p.value("stake_amount", 0);
+            res.push_back(item);
+        }
+        return res.dump();
+    } catch (...) {
+        return "[]";
     }
-    return res.dump();
+}
+
+std::string ECloakCoreImpl::switchProfile(const std::string& commitmentHex)
+{
+    if (commitmentHex.empty()) return makeErrorJson("Commitment cannot be empty");
+    syncProfilesStorage();
+    try {
+        std::string pPath = getProfilesFilePath();
+        if (!std::filesystem::exists(pPath)) return makeErrorJson("Profiles store not found");
+        std::ifstream f(pPath);
+        if (!f.is_open()) return makeErrorJson("Failed to open profiles store");
+        json rootJ; f >> rootJ;
+        if (!rootJ.contains("profiles") || !rootJ["profiles"].is_array()) return makeErrorJson("No profiles available");
+
+        json targetProfile;
+        bool found = false;
+        for (const auto& p : rootJ["profiles"]) {
+            if (p.value("commitment", "") == commitmentHex) {
+                targetProfile = p;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return makeErrorJson("Profile not found");
+
+        // 1. Save current state
+        savePersistedIdentity();
+
+        // 2. Clear in-memory chat sessions & joiner to prevent session mixing
+        for (auto& [id, sess] : m_chatSessions) {
+            if (sess) ffi_chat_session_free(sess);
+        }
+        m_chatSessions.clear();
+        if (m_chatJoiner) {
+            ffi_chat_joiner_free(m_chatJoiner);
+            m_chatJoiner = nullptr;
+        }
+
+        // 3. Re-initialize RegistrationClient with target NSK
+        std::string nskHex = targetProfile.value("nsk", "");
+        std::vector<uint8_t> nskBytes = hexToBytes(nskHex);
+        if (nskBytes.size() != 32) return makeErrorJson("Invalid NSK for target profile");
+
+        if (m_registration) ffi_registration_free(m_registration);
+        m_registration = ffi_registration_from_nsk(nskBytes.data());
+
+        m_cachedUsername = targetProfile.value("username", "");
+        m_staked = targetProfile.value("staked", false);
+        m_stakeAmount = targetProfile.value("stake_amount", 0);
+        m_onchainSynced = targetProfile.value("onchain_synced", true);
+
+        // 4. Update in-memory username registry
+        if (m_usernameRegistry && !m_cachedUsername.empty()) {
+            uint8_t comm[32];
+            ffi_registration_commitment(m_registration, comm);
+            char* res = ffi_username_registry_register(m_usernameRegistry, comm, m_cachedUsername.c_str());
+            if (res) ffi_identity_free_string(res);
+        }
+
+        // 5. Save updated active identity to identity.json
+        savePersistedIdentity();
+
+        // 6. Update active_commitment in profiles.json
+        rootJ["active_commitment"] = commitmentHex;
+        std::ofstream out(pPath);
+        if (out.is_open()) {
+            out << rootJ.dump(2);
+        }
+
+        json okRes;
+        okRes["ok"] = true;
+        okRes["active_username"] = m_cachedUsername;
+        okRes["active_commitment"] = commitmentHex;
+        return okRes.dump();
+    } catch (const std::exception& e) {
+        return makeErrorJson(std::string("Error switching profile: ") + e.what());
+    }
 }

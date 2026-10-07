@@ -108,6 +108,13 @@ public:
     std::string subscribeDeliveryTopic(const std::string& contentTopic);
     std::string pollDeliveryMessages(const std::string& contentTopic);
 
+    // On-Chain State Synchronization (Immutable Source of Truth from LEZ)
+    std::string syncOnChainState();
+
+    // Multi-Profile Management (Max 2 accounts per computer)
+    std::string getProfilesList();
+    std::string switchProfile(const std::string& commitmentHex);
+
 private:
     FfiRegistrationClient* m_registration = nullptr;
     FfiUsernameRegistry* m_usernameRegistry = nullptr;
@@ -138,5 +145,10 @@ private:
     void dispatchOnChainRegistration(const std::string& commitmentHex, const std::string& username);
     void syncRegisteredUsersFromFile();
     void persistRegisteredUser(const std::string& commitmentHex, const std::string& username);
+    void syncFromOnChainState();
+    std::string getActiveCommitmentHex();
+    std::string getScopedChatStoreEncFilePath();
+    std::string getScopedWalletStoreFilePath();
+    void syncProfilesStorage();
     std::vector<uint8_t> getStorageKey();
 };
