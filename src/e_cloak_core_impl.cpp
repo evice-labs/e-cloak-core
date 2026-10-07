@@ -2289,6 +2289,549 @@ std::string ECloakCoreImpl::getDeliveryStatus()
     return res.dump();
 }
 
+static std::string getDeliverySpoolDir() {
+    std::string d = getModuleDataDir() + "/delivery_spool";
+    std::error_code ec;
+    std::filesystem::create_directories(d, ec);
+    return d;
+}
+
+static std::string sanitizeTopicForFileName(const std::string& topic) {
+    std::string safe = topic;
+    for (char& c : safe) {
+        if (c == '/' || c == ':' || c == '\\' || c == '?' || c == '*' || c == '<' || c == '>' || c == '|') {
+            c = '_';
+        }
+    }
+    return safe;
+}
+
+static std::string getTopicSpoolFilePath(const std::string& topic) {
+    return getDeliverySpoolDir() + "/" + sanitizeTopicForFileName(topic) + ".json";
+}
+
+std::string ECloakCoreImpl::getSeenMessagesFilePath(const std::string& commHex) {
+    std::string prefix = commHex.empty() ? "anonymous" : commHex.substr(0, 16);
+    return getModuleDataDir() + "/seen_delivery_" + prefix + ".json";
+}
+
+void ECloakCoreImpl::loadSeenDeliveryMessages(const std::string& commHex) {
+    if (m_seenDeliveryMessageIds.find(commHex) != m_seenDeliveryMessageIds.end()) return;
+    m_seenDeliveryMessageIds[commHex] = std::unordered_set<std::string>();
+    std::string path = getSeenMessagesFilePath(commHex);
+    if (std::filesystem::exists(path)) {
+        try {
+            std::ifstream f(path);
+            if (f.is_open()) {
+                json j; f >> j;
+                if (j.is_array()) {
+                    for (const auto& item : j) {
+                        if (item.is_string()) {
+                            m_seenDeliveryMessageIds[commHex].insert(item.get<std::string>());
+                        }
+                    }
+                }
+            }
+        } catch (...) {}
+    }
+}
+
+void ECloakCoreImpl::saveSeenDeliveryMessages(const std::string& commHex) {
+    std::string path = getSeenMessagesFilePath(commHex);
+    try {
+        json j = json::array();
+        auto it = m_seenDeliveryMessageIds.find(commHex);
+        if (it != m_seenDeliveryMessageIds.end()) {
+            size_t count = 0;
+            for (const auto& id : it->second) {
+                j.push_back(id);
+                if (++count >= 2000) break;
+            }
+        }
+        std::ofstream f(path);
+        if (f.is_open()) {
+            f << j.dump();
+        }
+    } catch (...) {}
+}
+
+std::string ECloakCoreImpl::subscribeDeliveryTopic(const std::string& contentTopic)
+{
+    if (contentTopic.empty()) {
+        return makeErrorJson("contentTopic cannot be empty");
+    }
+    if (m_deliveryMessageBuffer.find(contentTopic) == m_deliveryMessageBuffer.end()) {
+        m_deliveryMessageBuffer[contentTopic] = std::vector<std::string>();
+    }
+    json res;
+    res["ok"] = true;
+    res["subscribed"] = contentTopic;
+    return res.dump();
+}
+
+std::string ECloakCoreImpl::publishDeliveryMessage(const std::string& contentTopic, const std::string& base64Payload)
+{
+    if (contentTopic.empty()) {
+        return makeErrorJson("contentTopic cannot be empty");
+    }
+    std::string senderComm = getActiveCommitmentHex();
+    auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    std::string msgId = "deliv_" + std::to_string(nowMs) + "_" + (senderComm.empty() ? "anon" : senderComm.substr(0, 8));
+    try {
+        msgId += "_" + std::to_string(std::hash<std::string>{}(base64Payload));
+    } catch (...) {}
+
+    // 1. In-memory buffer
+    m_deliveryMessageBuffer[contentTopic].push_back(base64Payload);
+
+    // 2. Mark as seen by the sender so sender does not receive its own echo on future polls
+    if (!senderComm.empty()) {
+        loadSeenDeliveryMessages(senderComm);
+        m_seenDeliveryMessageIds[senderComm].insert(msgId);
+        saveSeenDeliveryMessages(senderComm);
+    }
+
+    // 3. Persistent Spool File
+    try {
+        std::string spoolPath = getTopicSpoolFilePath(contentTopic);
+        json spoolArr = json::array();
+        if (std::filesystem::exists(spoolPath)) {
+            std::ifstream f(spoolPath);
+            if (f.is_open()) {
+                json existing;
+                f >> existing;
+                if (existing.is_array()) {
+                    spoolArr = existing;
+                }
+            }
+        }
+
+        json msgObj;
+        msgObj["id"] = msgId;
+        msgObj["topic"] = contentTopic;
+        msgObj["payload"] = base64Payload;
+        msgObj["sender"] = senderComm;
+        msgObj["timestamp"] = nowMs;
+
+        spoolArr.push_back(msgObj);
+        if (spoolArr.size() > 500) {
+            json trimmed = json::array();
+            for (size_t i = spoolArr.size() - 500; i < spoolArr.size(); ++i) {
+                trimmed.push_back(spoolArr[i]);
+            }
+            spoolArr = trimmed;
+        }
+
+        std::string tmpPath = spoolPath + ".tmp";
+        {
+            std::ofstream out(tmpPath);
+            if (out.is_open()) {
+                out << spoolArr.dump();
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmpPath, spoolPath, ec);
+        if (ec) {
+            std::filesystem::copy_file(tmpPath, spoolPath, std::filesystem::copy_options::overwrite_existing, ec);
+            std::filesystem::remove(tmpPath, ec);
+        }
+    } catch (...) {}
+
+    json res;
+    res["ok"] = true;
+    res["contentTopic"] = contentTopic;
+    res["payload_length"] = base64Payload.size();
+    res["published"] = true;
+    res["message_id"] = msgId;
+    return res.dump();
+}
+
+std::string ECloakCoreImpl::pollDeliveryMessages(const std::string& contentTopic)
+{
+    json res;
+    res["ok"] = true;
+    res["contentTopic"] = contentTopic;
+    res["messages"] = json::array();
+
+    if (contentTopic.empty()) {
+        return res.dump();
+    }
+
+    std::string callerComm = getActiveCommitmentHex();
+    loadSeenDeliveryMessages(callerComm);
+
+    std::string spoolPath = getTopicSpoolFilePath(contentTopic);
+    std::vector<std::string> newMessages;
+    std::vector<std::string> newlySeenIds;
+
+    if (std::filesystem::exists(spoolPath)) {
+        try {
+            std::ifstream f(spoolPath);
+            if (f.is_open()) {
+                json spoolArr;
+                f >> spoolArr;
+                if (spoolArr.is_array()) {
+                    for (const auto& item : spoolArr) {
+                        if (!item.is_object()) continue;
+                        std::string id = item.value("id", "");
+                        std::string payload = item.value("payload", "");
+
+                        if (!id.empty() && m_seenDeliveryMessageIds[callerComm].count(id) > 0) {
+                            continue;
+                        }
+
+                        if (!payload.empty()) {
+                            newMessages.push_back(payload);
+                            if (!id.empty()) {
+                                newlySeenIds.push_back(id);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (...) {}
+    }
+
+    auto it = m_deliveryMessageBuffer.find(contentTopic);
+    if (it != m_deliveryMessageBuffer.end() && !it->second.empty()) {
+        for (const auto& msg : it->second) {
+            bool alreadyInList = false;
+            for (const auto& m : newMessages) {
+                if (m == msg) { alreadyInList = true; break; }
+            }
+            if (!alreadyInList) {
+                newMessages.push_back(msg);
+            }
+        }
+        it->second.clear();
+    }
+
+    if (!newlySeenIds.empty()) {
+        for (const auto& id : newlySeenIds) {
+            m_seenDeliveryMessageIds[callerComm].insert(id);
+        }
+        saveSeenDeliveryMessages(callerComm);
+    }
+
+    for (const auto& msg : newMessages) {
+        res["messages"].push_back(msg);
+
+        if (contentTopic == "/e-identity/1/global-registry/proto") {
+            try {
+                std::vector<uint8_t> decoded = base64Decode(msg);
+                std::string jsonStr(decoded.begin(), decoded.end());
+                auto j = json::parse(jsonStr);
+                if (j.contains("type") && j["type"] == "USER_REGISTRATION" &&
+                    j.contains("username") && j.contains("commitment")) {
+                    std::string u = j["username"].get<std::string>();
+                    std::string c = j["commitment"].get<std::string>();
+                    persistRegisteredUser(c, u);
+                    if (m_usernameRegistry) {
+                        std::vector<uint8_t> comm = hexToBytes(c);
+                        if (comm.size() == 32) {
+                            char* r = ffi_username_registry_register(m_usernameRegistry, comm.data(), u.c_str());
+                            if (r) ffi_identity_free_string(r);
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+
+    return res.dump();
+}
+
+
+// ---------------------------------------------------------------------------
+// On-Chain Smart Contract Source-of-Truth Synchronization (Borsh Decoder)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct BorshReader {
+    const uint8_t* data;
+    size_t size;
+    size_t offset = 0;
+
+    bool readBytes(uint8_t* out, size_t len) {
+        if (offset + len > size) return false;
+        std::memcpy(out, data + offset, len);
+        offset += len;
+        return true;
+    }
+
+    bool skip(size_t len) {
+        if (offset + len > size) return false;
+        offset += len;
+        return true;
+    }
+
+    bool readU32(uint32_t& out) {
+        if (offset + 4 > size) return false;
+        out = static_cast<uint32_t>(data[offset]) |
+              (static_cast<uint32_t>(data[offset + 1]) << 8) |
+              (static_cast<uint32_t>(data[offset + 2]) << 16) |
+              (static_cast<uint32_t>(data[offset + 3]) << 24);
+        offset += 4;
+        return true;
+    }
+
+    bool readU64(uint64_t& out) {
+        if (offset + 8 > size) return false;
+        out = 0;
+        for (int i = 0; i < 8; ++i) {
+            out |= (static_cast<uint64_t>(data[offset + i]) << (i * 8));
+        }
+        offset += 8;
+        return true;
+    }
+
+    bool readString(std::string& out) {
+        uint32_t len = 0;
+        if (!readU32(len)) return false;
+        if (offset + len > size) return false;
+        out.assign(reinterpret_cast<const char*>(data + offset), len);
+        offset += len;
+        return true;
+    }
+};
+
+struct OnChainUserData {
+    std::string commitment;
+    std::string username;
+};
+
+struct OnChainForumState {
+    std::vector<std::string> registeredCommitments;
+    std::vector<std::string> revokedCommitments;
+    std::vector<OnChainUserData> usernames;
+    std::vector<std::pair<std::string, uint64_t>> memberStakes;
+    uint64_t totalStaked = 0;
+};
+
+static bool parseForumInstance(const uint8_t* rawData, size_t len, OnChainForumState& outState) {
+    if (!rawData || len < 44) return false;
+    BorshReader r{ rawData, len, 0 };
+
+    // Header: admin_pubkey (32), k_strikes (4), n_mod (4), m_mod (4)
+    if (!r.skip(44)) return false;
+
+    // registered_commitments: Vec<[u8; 32]>
+    uint32_t regCount = 0;
+    if (!r.readU32(regCount)) return false;
+    for (uint32_t i = 0; i < regCount; ++i) {
+        uint8_t comm[32];
+        if (!r.readBytes(comm, 32)) return false;
+        outState.registeredCommitments.push_back(bytesToHex(comm, 32));
+    }
+
+    // revoked_commitments: Vec<[u8; 32]>
+    uint32_t revCount = 0;
+    if (!r.readU32(revCount)) return false;
+    for (uint32_t i = 0; i < revCount; ++i) {
+        uint8_t comm[32];
+        if (!r.readBytes(comm, 32)) return false;
+        outState.revokedCommitments.push_back(bytesToHex(comm, 32));
+    }
+
+    // total_staked: u64
+    if (!r.readU64(outState.totalStaked)) return false;
+
+    // member_stakes: Vec<([u8; 32], u64)>
+    uint32_t stakeCount = 0;
+    if (!r.readU32(stakeCount)) return false;
+    for (uint32_t i = 0; i < stakeCount; ++i) {
+        uint8_t comm[32];
+        uint64_t amt = 0;
+        if (!r.readBytes(comm, 32)) return false;
+        if (!r.readU64(amt)) return false;
+        outState.memberStakes.push_back({ bytesToHex(comm, 32), amt });
+    }
+
+    // used_tracing_tags: Vec<[u8; 32]>
+    uint32_t tagCount = 0;
+    if (!r.readU32(tagCount)) return false;
+    for (uint32_t i = 0; i < tagCount; ++i) {
+        if (!r.skip(32)) return false;
+    }
+
+    // rooms: Vec<OnChainRoom>
+    uint32_t roomCount = 0;
+    if (!r.readU32(roomCount)) return false;
+    for (uint32_t i = 0; i < roomCount; ++i) {
+        if (!r.skip(64)) return false; // room_id (32) + admin_comm (32)
+        if (!r.skip(8)) return false;  // n_mod (4) + m_mod (4)
+        uint32_t modCount = 0;
+        if (!r.readU32(modCount)) return false;
+        if (!r.skip(modCount * 32)) return false;
+        if (!r.skip(8)) return false;  // creation_index (8)
+        if (!r.skip(4)) return false;  // min_members_for_maturity (4)
+    }
+
+    // room_memberships: Vec<OnChainMembership>
+    uint32_t memCount = 0;
+    if (!r.readU32(memCount)) return false;
+    for (uint32_t i = 0; i < memCount; ++i) {
+        if (!r.skip(64)) return false; // room_id (32) + member_comm (32)
+        if (!r.skip(8)) return false;  // join_index (8)
+        if (!r.skip(1)) return false;  // is_active bool (1)
+    }
+
+    // recorded_strikes: Vec<OnChainStrike>
+    uint32_t strikeCount = 0;
+    if (!r.readU32(strikeCount)) return false;
+    for (uint32_t i = 0; i < strikeCount; ++i) {
+        if (!r.skip(96)) return false; // room_id (32) + target_comm (32) + evidence_hash (32)
+        if (!r.skip(8)) return false;  // strike_index (8)
+        if (!r.skip(4)) return false;  // n_valid_sigs (4)
+    }
+
+    // current_index: u64
+    if (!r.skip(8)) return false;
+
+    // usernames: Vec<OnChainUsername>
+    uint32_t userCount = 0;
+    if (!r.readU32(userCount)) return false;
+    for (uint32_t i = 0; i < userCount; ++i) {
+        uint8_t comm[32];
+        if (!r.readBytes(comm, 32)) return false;
+        std::string uname;
+        if (!r.readString(uname)) return false;
+        outState.usernames.push_back({ bytesToHex(comm, 32), uname });
+    }
+
+    return true;
+}
+
+} // namespace
+
+void ECloakCoreImpl::syncFromOnChainState()
+{
+    try {
+        std::string forumPda = "99jBsXRbK91xCJR5WnxFVR2cuGvga8M4dDfaT3J2oC1Q";
+        
+        json req;
+        req["jsonrpc"] = "2.0";
+        req["method"] = "getAccount";
+        req["params"] = json::array({ forumPda });
+        req["id"] = 1;
+        std::string postData = req.dump();
+
+        std::string cmd = "env -u LD_LIBRARY_PATH curl -s --max-time 6 -X POST https://testnet.lez.logos.co/ -H 'Content-Type: application/json' -d '" + postData + "' 2>/dev/null";
+
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) return;
+
+        std::string output;
+        char buf[512];
+        while (fgets(buf, sizeof(buf), pipe) != nullptr) {
+            output += buf;
+        }
+        pclose(pipe);
+
+        if (output.empty() || output.find("502 Bad Gateway") != std::string::npos) {
+            return;
+        }
+
+        auto j = json::parse(output);
+        if (!j.contains("result") || !j["result"].is_object()) return;
+        auto resObj = j["result"];
+        if (!resObj.contains("data") || !resObj["data"].is_object()) return;
+        auto dataObj = resObj["data"];
+        if (!dataObj.contains("shards") || !dataObj["shards"].is_object()) return;
+
+        // Find program shard (any non-token shard)
+        std::vector<uint8_t> rawShardBytes;
+        for (auto& [shardKey, shardVal] : dataObj["shards"].items()) {
+            if (shardKey != "11111111111111111111111111111111" && shardVal.is_array() && !shardVal.empty()) {
+                rawShardBytes.reserve(shardVal.size());
+                for (const auto& byteVal : shardVal) {
+                    if (byteVal.is_number_unsigned()) {
+                        rawShardBytes.push_back(static_cast<uint8_t>(byteVal.get<unsigned int>()));
+                    }
+                }
+                break;
+            }
+        }
+
+        if (rawShardBytes.empty()) return;
+
+        OnChainForumState state;
+        if (!parseForumInstance(rawShardBytes.data(), rawShardBytes.size(), state)) {
+            return;
+        }
+
+        // 1. Update usernames & persist to local registered_users.json
+        for (const auto& u : state.usernames) {
+            persistRegisteredUser(u.commitment, u.username);
+            if (m_usernameRegistry) {
+                std::vector<uint8_t> comm = hexToBytes(u.commitment);
+                if (comm.size() == 32) {
+                    char* r = ffi_username_registry_register(m_usernameRegistry, comm.data(), u.username.c_str());
+                    if (r) ffi_identity_free_string(r);
+                }
+            }
+        }
+
+        // 2. Update revoked commitments in blacklist
+        if (m_blacklist) {
+            for (const auto& revCommHex : state.revokedCommitments) {
+                std::vector<uint8_t> comm = hexToBytes(revCommHex);
+                if (comm.size() == 32) {
+                    char* r = ffi_blacklist_revoke(m_blacklist, comm.data());
+                    if (r) ffi_identity_free_string(r);
+                }
+            }
+        }
+
+        // 3. Reconcile local active user identity with on-chain source-of-truth
+        if (m_registration) {
+            uint8_t myCommBytes[32];
+            ffi_registration_commitment(m_registration, myCommBytes);
+            std::string myCommHex = bytesToHex(myCommBytes, 32);
+
+            bool isReg = std::find(state.registeredCommitments.begin(), state.registeredCommitments.end(), myCommHex) != state.registeredCommitments.end();
+            if (isReg) {
+                m_onchainSynced = true;
+                for (const auto& u : state.usernames) {
+                    if (u.commitment == myCommHex) {
+                        m_cachedUsername = u.username;
+                        break;
+                    }
+                }
+                for (const auto& [stkComm, stkAmt] : state.memberStakes) {
+                    if (stkComm == myCommHex) {
+                        m_stakeAmount = stkAmt;
+                        m_staked = true;
+                        break;
+                    }
+                }
+                savePersistedIdentity();
+            }
+        }
+    } catch (...) {}
+}
+
+std::string ECloakCoreImpl::syncOnChainState()
+{
+    syncFromOnChainState();
+    json res;
+    res["ok"] = true;
+    res["source_of_truth"] = "LEZ_SMART_CONTRACT";
+    res["has_identity"] = (m_registration != nullptr);
+    res["onchain_synced"] = m_onchainSynced;
+    res["username"] = m_cachedUsername;
+    res["stake_amount"] = m_stakeAmount;
+    return res.dump();
+}
+
+
+// ---------------------------------------------------------------------------
+// Multi-Profile Management (Max 2 accounts per computer)
+// ---------------------------------------------------------------------------
+
 
 
 std::string ECloakCoreImpl::getActiveCommitmentHex() {

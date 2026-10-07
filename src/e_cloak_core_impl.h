@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdint>
 #include "logos_module_context.h"
 
@@ -150,5 +151,9 @@ private:
     std::string getScopedChatStoreEncFilePath();
     std::string getScopedWalletStoreFilePath();
     void syncProfilesStorage();
+    std::unordered_map<std::string, std::unordered_set<std::string>> m_seenDeliveryMessageIds;
+    std::string getSeenMessagesFilePath(const std::string& commHex);
+    void loadSeenDeliveryMessages(const std::string& commHex);
+    void saveSeenDeliveryMessages(const std::string& commHex);
     std::vector<uint8_t> getStorageKey();
 };
